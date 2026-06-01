@@ -1,0 +1,13 @@
+bin/
+lib/*.a
+*.o
+*.d
+var/log/
+var/run/
+auth/server.key
+auth/server.crt
+auth/cacsertificate.crt
+application
+networking
+systems
+.DS_Store
