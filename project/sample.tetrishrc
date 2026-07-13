@@ -1,7 +1,7 @@
-# sample.tetrishrc: tetriSH configuration contract
+# sample.tetrishrc - tetriSH configuration contract
 # Copy to .tetrishrc and edit. All daemons read this at startup.
 # Format: key<whitespace>value   # comment runs to end of line
-#         blank lines ignored, unknown keys warn and are ignored, last duplicate wins
+#         blank lines ignored, unknown keys warn + ignored, last duplicate wins
 #         relative paths resolve against the project root
 
 # ---------REQUIRED----------(daemon refuses to start if any are missing)
@@ -31,3 +31,4 @@ log_level            info                     # debug | info | warn | error
 snapshot_interval    60                       # ticks between SNAPSHOT log records
 max_rooms            16                       # max concurrent rooms
 max_players_per_room 6                        # cap per room
+garbage_mq           /tetrish-garbage         # POSIX mq name, Battle Royale garbage channel (must start with /)

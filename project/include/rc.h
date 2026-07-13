@@ -31,6 +31,7 @@ typedef struct {
     int snapshot_interval;
     int max_rooms;
     int max_players_per_room;
+    char garbage_mq[RC_PATHLEN];   // POSIX mq name for Battle Royale garbage (must start with '/')
 } Config;
 
 // returns 0 on success and -1 on failure (missing file/ missing required keys)

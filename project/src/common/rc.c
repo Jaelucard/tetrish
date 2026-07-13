@@ -62,7 +62,8 @@ int rc_load(const char *path, Config *out){
     out->snapshot_interval = 60;
     out->max_rooms = 16;
     out->max_players_per_room = 6;
-    // Phase 2: open the file (fail loudly if missing. a daemon with no
+    strcpy(out->garbage_mq, "/tetrish-garbage"); // POSIX mq names must start with '/'
+    // Phase 2: open the file (fail loudly if missing - a daemon with no
     // config must refuse to start, not run on guesses).
     FILE *fp = fopen(path, "r");
     if (fp == NULL) {
@@ -105,6 +106,7 @@ int rc_load(const char *path, Config *out){
         else if (strcmp(key, "pid_path")  == 0) copy_str(out->pid_path,  value, RC_PATHLEN);
         else if (strcmp(key, "bind")      == 0) copy_str(out->bind_addr, value, RC_PATHLEN);
         else if (strcmp(key, "log_level") == 0) copy_str(out->log_level, value, RC_PATHLEN);
+        else if (strcmp(key, "garbage_mq") == 0) copy_str(out->garbage_mq, value, RC_PATHLEN);
         // Integer fields (base 10):
         else if (strcmp(key, "listen_port")          == 0) { if (parse_int(value, 10, &out->listen_port)          != 0) goto badnum; }
         else if (strcmp(key, "tcp_backlog")          == 0) { if (parse_int(value, 10, &out->tcp_backlog)          != 0) goto badnum; }
