@@ -1,0 +1,20 @@
+# One dev container that holds ALL tetriSH processes (tetrish, tetrisd,
+# tetrislogd, tetrisctl, ...). They MUST share one kernel / filesystem /
+# network namespace because they talk over AF_UNIX sockets and a PID file,
+# so this is intentionally a SINGLE service -- not one-container-per-daemon.
+services:
+  dev:
+    build:
+      context: ../project         # compose.yaml lives in .devcontainer/, so
+                                  #   the Dockerfile in project/ is one level up
+      dockerfile: Dockerfile
+    image: tetrish-dev
+    init: true                    # PID-1 init that reaps zombie children.
+                                  # This keeps the process table clean
+                    
+    volumes:
+      - ..:/work                  # mount the WHOLE repo (one level up from
+                                  #   .devcontainer/). Edit on host; build in here.
+    working_dir: /work/project
+    stdin_open: true              
+    tty: true                     

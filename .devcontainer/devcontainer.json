@@ -1,0 +1,26 @@
+{
+  "name": "tetrish-dev",
+
+  "dockerComposeFile": "compose.yaml",
+  "service": "dev",
+
+  // VS Code opens the whole repo.
+  "workspaceFolder": "/work",
+
+  // Lifecycle hooks (see the three scripts in this folder).
+  "initializeCommand": "bash .devcontainer/initialize.sh",
+  "postCreateCommand": "bash .devcontainer/postcreate.sh",
+  "postStartCommand": "bash .devcontainer/poststart.sh",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.makefile-tools"
+      ],
+      "settings": {
+        "C_Cpp.default.cStandard": "c11"
+      }
+    }
+  }
+}
