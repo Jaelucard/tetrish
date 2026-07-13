@@ -1,13 +1,26 @@
+# Build artifacts (patterns are unanchored so they match at any depth, e.g. project/)
 bin/
-lib/*.a
+*.a
 *.o
 *.d
+build/
+# macOS debug bundles (stale from earlier Mac builds)
+*.dSYM/
+.DS_Store
+# Runtime state
 var/log/
 var/run/
+# Secrets / generated keys
 auth/server.key
 auth/server.crt
 auth/cacsertificate.crt
+# Reference repositories (cloned as siblings, not committed)
 application
 networking
 systems
-.DS_Store
+# Course handout material (kept locally for reference, not part of the deliverable)
+Programming Assignment 1/
+# Unrelated coursework (50.003 ESC repos live alongside; not part of tetriSH)
+ESC/
+# Tooling / harness state
+.omc/
