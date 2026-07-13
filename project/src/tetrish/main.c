@@ -273,8 +273,13 @@ static int launch(char **argv){
     _exit(127);                     // _exit (not exit) in a child: no stdio double-flush
   }
   // PARENT: reap the child so it does not linger as a zombie.
+  // The EINTR loop matters now that SIGINT has NO SA_RESTART: Ctrl+C aimed
+  // at the foreground child interrupts OUR waitpid too - without the retry
+  // we would abandon the child (zombie + shell prompt fighting the child
+  // for the terminal).
   int status;
-  waitpid(pid, &status, 0);
+  while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+    ;                               // interrupted, child still ours: keep waiting
   return 0;
 }
 
@@ -294,8 +299,22 @@ static int split_line(char *line, char **out, int max){
 }
 
 int main(int argc, char **argv){
-  // Set up a signal handler for ctrl + c or input quit
-  signal(SIGINT, handle_signal);
+  // Set up the handler for SIGINT, which is the signal that Ctrl+C sends. We
+  // use sigaction with sa_flags set to 0, which means we deliberately do not
+  // ask for SA_RESTART.
+  // Here is why that matters. The older signal() function turns SA_RESTART on
+  // for you behind the scenes. With SA_RESTART on, a blocked fgets is quietly
+  // restarted after the handler runs, so pressing Ctrl+C looked like it did
+  // nothing, and the "Interrupted by user" branch further down could never
+  // run. With sa_flags set to 0, fgets instead returns NULL and sets errno to
+  // EINTR, so the loop notices the interrupt and can print a fresh prompt.
+  // (This is the same reason tetrislogd sets up its recvfrom the same way.)
+  struct sigaction sa_int;
+  memset(&sa_int, 0, sizeof sa_int);
+  sa_int.sa_handler = handle_signal;
+  sigemptyset(&sa_int.sa_mask);
+  sa_int.sa_flags = 0;
+  sigaction(SIGINT, &sa_int, NULL);
 
   // The system sends SIGCHLD whenever any of our children changes state, and
   // that is how we find out that a background job has finished. We use
