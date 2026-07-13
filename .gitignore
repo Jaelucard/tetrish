@@ -14,6 +14,9 @@ var/run/
 auth/server.key
 auth/server.crt
 auth/cacsertificate.crt
+auth/ca.key
+auth/ca.srl
+auth/server.csr
 # Reference repositories (cloned as siblings, not committed)
 application
 networking

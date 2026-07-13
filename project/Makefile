@@ -7,7 +7,14 @@ CC       := gcc
 # -pthread: tetrisd now has the logshipper thread (and the test harnesses
 # spawn threads too). It is both a compile flag (thread-safe libc) and a link
 # flag (libpthread), so it lives in CFLAGS which we use for both steps.
-CFLAGS   := -Wall -Wextra -g -pthread -I include
+# -I src/libtetrisbrain: tetrisbrain.h lives next to its .c (APP teammate's
+# layout) rather than in include/; tetrisd's rooms module includes it.
+# (Literal path, not $(SRCDIR): CFLAGS uses := which expands IMMEDIATELY,
+# and SRCDIR is defined further down - $(SRCDIR) here would be empty.)
+CFLAGS   := -Wall -Wextra -g -pthread -I include -I src/libtetrisbrain
+# OpenSSL: libtetrissh uses the EVP API, so every binary that links it needs
+# libssl/libcrypto at the END of the link line (static .a resolution order).
+SSLLIBS  := -lssl -lcrypto
 # Header dependency generation, applied when compiling each .o:
 #   -MMD  emit a .d file next to the .o listing the headers that .c #includes
 #   -MP   also emit an empty phony target per header, so DELETING a header
@@ -35,21 +42,26 @@ BRAIN_OBJ := $(BUILDDIR)/libtetrisbrain/tetrisbrain.o
 # rc.o     : the .tetrishrc parser (tetrish, tetrisd, tetrislogd, tetrisctl)
 # daemon.o : the double-fork helper (tetrisd, tetrislogd)
 # ring.o   : the log ring buffer (tetrisd + the ring test harnesses)
-COMMON_OBJ := $(BUILDDIR)/common/rc.o
-DAEMON_OBJ := $(BUILDDIR)/common/daemon.o
-RING_OBJ   := $(BUILDDIR)/tetrisd/ring.o
+# clients.o/rooms.o : tetrisd's per-connection + room state (Week 6)
+COMMON_OBJ  := $(BUILDDIR)/common/rc.o
+DAEMON_OBJ  := $(BUILDDIR)/common/daemon.o
+RING_OBJ    := $(BUILDDIR)/tetrisd/ring.o
+TETRISD_OBJ := $(BUILDDIR)/tetrisd/main.o $(RING_OBJ) \
+               $(BUILDDIR)/tetrisd/clients.o $(BUILDDIR)/tetrisd/rooms.o
 
 # --- Binaries ---
 BIN_NAMES := tetrish tetrisd tetrislogd tetrisctl tetrisu tetrish-view
 BINS      := $(addprefix $(BINDIR)/,$(BIN_NAMES))
 
 # --- Test harnesses (built by `make test`) ---
-TEST_BINS := $(BUILDDIR)/tests/test_ring $(BUILDDIR)/tests/stress_ring
-TEST_OBJ  := $(BUILDDIR)/tests/test_ring.o $(BUILDDIR)/tests/stress_ring.o
+TEST_BINS := $(BUILDDIR)/tests/test_ring $(BUILDDIR)/tests/stress_ring \
+             $(BUILDDIR)/tests/stub_client
+TEST_OBJ  := $(BUILDDIR)/tests/test_ring.o $(BUILDDIR)/tests/stress_ring.o \
+             $(BUILDDIR)/tests/stub_client.o
 
 # Every object we compile, so we can pull in its generated .d dependency file.
 BIN_OBJ := $(foreach n,$(BIN_NAMES),$(BUILDDIR)/$(n)/main.o)
-ALL_OBJ := $(SSH_OBJ) $(HTTTP_OBJ) $(BRAIN_OBJ) $(COMMON_OBJ) $(DAEMON_OBJ) $(RING_OBJ) $(BIN_OBJ) $(TEST_OBJ)
+ALL_OBJ := $(SSH_OBJ) $(HTTTP_OBJ) $(BRAIN_OBJ) $(COMMON_OBJ) $(DAEMON_OBJ) $(TETRISD_OBJ) $(BIN_OBJ) $(TEST_OBJ)
 
 .PHONY: all libs bins test clean
 
@@ -88,15 +100,18 @@ $(BINDIR)/tetrish: $(BUILDDIR)/tetrish/main.o $(COMMON_OBJ)
 # -lrt: POSIX message queues (mq_open & friends) traditionally live in librt.
 # Modern glibc has them in libc proper, but linking librt is harmless and
 # keeps the build portable to older toolchains.
-$(BINDIR)/tetrisd: $(BUILDDIR)/tetrisd/main.o $(RING_OBJ) $(COMMON_OBJ) $(DAEMON_OBJ)
+# tetrisd now links all three team libraries: tetrissh (session), htttp
+# (protocol), tetrisbrain (game logic) - plus OpenSSL for tetrissh.
+$(BINDIR)/tetrisd: $(TETRISD_OBJ) $(COMMON_OBJ) $(DAEMON_OBJ) $(LIB_SSH) $(LIB_HTTTP) $(LIB_BRAIN)
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) -o $@ $^ -lrt
+	$(CC) $(CFLAGS) -o $@ $^ $(SSLLIBS) -lrt
 
 $(BINDIR)/tetrislogd: $(BUILDDIR)/tetrislogd/main.o $(COMMON_OBJ) $(DAEMON_OBJ)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -o $@ $^
 
-$(BINDIR)/tetrisctl: $(BUILDDIR)/tetrisctl/main.o $(COMMON_OBJ)
+# tetrisctl speaks HTTTP now (Week 6), so it links libhtttp too.
+$(BINDIR)/tetrisctl: $(BUILDDIR)/tetrisctl/main.o $(COMMON_OBJ) $(LIB_HTTTP)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -o $@ $^
 
@@ -121,6 +136,10 @@ $(BUILDDIR)/tests/test_ring: $(BUILDDIR)/tests/test_ring.o $(RING_OBJ)
 $(BUILDDIR)/tests/stress_ring: $(BUILDDIR)/tests/stress_ring.o $(RING_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^
 
+# The Week-6 integration harness: full handshake + JOIN/START/STATE/MOVE/LEAVE.
+$(BUILDDIR)/tests/stub_client: $(BUILDDIR)/tests/stub_client.o $(COMMON_OBJ) $(LIB_SSH) $(LIB_HTTTP)
+	$(CC) $(CFLAGS) -o $@ $^ $(SSLLIBS)
+
 test: $(TEST_BINS)
 	$(BUILDDIR)/tests/test_ring
 	@echo ""
@@ -128,6 +147,11 @@ test: $(TEST_BINS)
 	@echo "  1. start tetrislogd:  bin/tetrislogd <rc-file>"
 	@echo "  2. blast it:          $(BUILDDIR)/tests/stress_ring <log_ipc path> [n_records]"
 	@echo "  3. compare its 'delivered' number against: grep -c STRESS <log_path>"
+	@echo ""
+	@echo "integration harness built: $(BUILDDIR)/tests/stub_client"
+	@echo "  1. generate keys once: bash auth/generate_keys.sh"
+	@echo "  2. start tetrislogd + tetrisd with the same rc file"
+	@echo "  3. run: $(BUILDDIR)/tests/stub_client <rc-file> [room] [seconds]"
 
 clean:
 	rm -rf $(BUILDDIR)
