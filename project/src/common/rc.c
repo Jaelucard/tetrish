@@ -144,6 +144,14 @@ int rc_load(const char *path, Config *out){
     // overwritten). A missing required key is a hard failure.
     int ok = 0;
     if (out->listen_port < 0)      { fprintf(stderr, "rc_load: missing required 'listen_port'\n"); ok = -1; }
+    // A TCP port number only goes up to 65535, because it is stored in 16 bits.
+    // If we let a bigger number through, the (uint16_t) cast that tetrisd uses
+    // later would quietly wrap it around to the wrong port (for example 70000
+    // would become 4464), so we reject it here instead.
+    else if (out->listen_port < 1 || out->listen_port > 65535){
+        fprintf(stderr, "rc_load: listen_port %d out of range 1-65535\n", out->listen_port);
+        ok = -1;
+    }
     if (out->cert_path[0] == '\0') { fprintf(stderr, "rc_load: missing required 'cert_path'\n");   ok = -1; }
     if (out->key_path[0]  == '\0') { fprintf(stderr, "rc_load: missing required 'key_path'\n");    ok = -1; }
     if (out->ca_path[0]   == '\0') { fprintf(stderr, "rc_load: missing required 'ca_path'\n");     ok = -1; }
