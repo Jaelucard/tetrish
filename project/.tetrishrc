@@ -1,0 +1,34 @@
+# sample.tetrishrc - tetriSH configuration contract
+# Copy to .tetrishrc and edit. All daemons read this at startup.
+# Format: key<whitespace>value   # comment runs to end of line
+#         blank lines ignored, unknown keys warn + ignored, last duplicate wins
+#         relative paths resolve against the project root
+
+# ---------REQUIRED----------(daemon refuses to start if any are missing)
+listen_port    7777                          # tetrisd TCP listen port
+cert_path      auth/server.crt               # server X.509 cert (sent in handshake)
+key_path       auth/server.key               # server private key (RSA-PSS sign / OAEP)
+ca_path        auth/cacsertificate.crt       # CA bundle clients verify the cert against
+log_path       var/log/tetrisd.log           # where tetrislogd writes records
+log_ipc        var/run/tetrislogd.sock       # AF_UNIX DGRAM: tetrisd -> tetrislogd
+ctl_path       var/run/tetrisctl.sock        # AF_UNIX STREAM: tetrisctl -> tetrisd
+
+# ----------OPERATIONAL----------(optional: parser prefills defaults)
+daemonize      no                            # toggle the double-fork instead of compiling it in
+pid_path       var/run/tetrisd.pid           # configurable PID file path, not hard-coded
+bind           127.0.0.1                     # interface to listen on; loopback-only default
+tcp_backlog    128                           # listen() backlog depth
+tcp_keepalive  120                           # SO_KEEPALIVE secs; detects half-dead clients
+
+# ----------PLANNED (post-gate)----------(parsed + stored, NOT yet enforced)
+client_timeout 60                            # close idle client after N secs   [issue #10]
+max_clients    64                            # reject past this at accept()      [issue #7/#11]
+ctl_perm       0700                          # octal perms on ctl_path socket   (parse base 8!)
+
+# --------GAME----------(optional tunables)
+tick_hz              20                       # game ticks/sec
+log_level            info                     # debug | info | warn | error
+snapshot_interval    60                       # ticks between SNAPSHOT log records
+max_rooms            16                       # max concurrent rooms
+max_players_per_room 6                        # cap per room
+garbage_mq           /tetrish-garbage         # POSIX mq name, Battle Royale garbage channel (must start with /)

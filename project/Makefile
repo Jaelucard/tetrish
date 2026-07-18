@@ -34,7 +34,7 @@ LIB_HTTTP := $(LIBDIR)/libhtttp.a
 LIB_BRAIN := $(LIBDIR)/libtetrisbrain.a
 LIBS      := $(LIB_SSH) $(LIB_HTTTP) $(LIB_BRAIN)
 
-SSH_OBJ   := $(BUILDDIR)/libtetrissh/tetrissh.o
+SSH_OBJ   := $(BUILDDIR)/common/secure_session.o $(BUILDDIR)/libtetrissh/tetrissh.o
 HTTTP_OBJ := $(BUILDDIR)/libhtttp/htttp.o
 BRAIN_OBJ := $(BUILDDIR)/libtetrisbrain/tetrisbrain.o
 
