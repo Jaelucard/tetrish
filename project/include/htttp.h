@@ -29,8 +29,11 @@ typedef enum {
     HTTTP_METHOD_MOVE,
     HTTTP_METHOD_ROTATE,
     HTTTP_METHOD_DROP,
-    HTTTP_METHOD_STATE,
-    HTTTP_METHOD_GET,
+    HTTTP_METHOD_STATE,          // Server-originated broadcast.
+    HTTTP_METHOD_GET,            // For control-plane polls.
+    HTTTP_METHOD_ADMIN_STATUS,   // GET-like: server + room + player counts.
+    HTTTP_METHOD_ADMIN_ROOMS,    // GET-like: full room list, same shape as ctl's /rooms.
+    HTTTP_METHOD_ADMIN_ATTACH,   // Subscribes this connection to a room's STATE stream, read-only.
 } htttp_method_t;
 
 typedef enum {
