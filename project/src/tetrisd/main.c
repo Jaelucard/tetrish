@@ -1,6 +1,6 @@
 // tetrisd is the game server daemon.
 //
-// The Week-6 shape of this file: the epoll loop now runs the full pipeline for
+// The overall shape of this file: the epoll loop now runs the full pipeline for
 // a game client, which is:
 //
 //   accept -> libtetrissh handshake -> [4-byte length][AES frame] -> decrypt ->
@@ -52,6 +52,7 @@
 #include <sys/timerfd.h>     // per-room tickers
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>            // clock_gettime, struct timespec (uptime)
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/un.h>
@@ -71,6 +72,13 @@
 // not clarity.
 static Config g_cfg;
 static int    g_ep = -1;
+// When the daemon started, used only to answer "uptime" on the control plane.
+// Redis uses time(NULL) which is the wall clock. if NTP steps the clock backwards, then redis would report negative uptime
+// Instead I will use CLOCK_MONOTONIC which would count from an arbitary boot-relative origin and cannot go backwards
+// This is more consistent with the rest of the daemon and it is already used for the room ticker
+// TLDR: I am diverging from redis here because monotonic clocks cannot be stepped (cannot make sudden jumps forward or backward)
+// compared to redis which uses wall clock time which can be stepped by NTP or other system adjustments
+static struct timespec g_started;
 
 // --- logging: ring buffer + logshipper thread ------------------------------
 static int log_fd = -1;
@@ -126,6 +134,16 @@ static void *logshipper(void *arg){
 
 static unsigned long total_dropped(void){
     return ring_dropped(&g_ring) + atomic_load(&dropped_send);
+}
+
+// a function to check how many seconds since the daemon started
+// start off with making a blank timespec to hold a time
+// then call clock_gettime with CLOCK_MONOTONIC to get the current time
+// then return the difference between the current time and the start time in seconds
+static long uptime_seconds(void){
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long)(now.tv_sec - g_started.tv_sec);
 }
 
 // --- listeners --------------------------------------------------------------
@@ -754,8 +772,10 @@ static void handle_ctl(int ctl_fd, int *running){
         jb_append(&j, "{\"error\": \"control plane accepts GET only\"}");
     } else if (strcmp(msg.path, "/status") == 0){
         status = HTTTP_200_OK;
-        jb_append(&j, "{\"rooms\": %d, \"players\": %d, \"dropped_logs\": %lu}",
-                  rooms_count(), client_count(), total_dropped());
+        jb_append(&j, "{\"uptime_seconds\": %ld, \"rooms\": %d, "
+                      "\"players\": %d, \"dropped_logs\": %lu}",
+                  uptime_seconds(), rooms_count(), client_count(),
+                  total_dropped());
     } else if (strcmp(msg.path, "/rooms") == 0){
         status = HTTTP_200_OK;
         jb_append(&j, "[");
@@ -766,6 +786,11 @@ static void handle_ctl(int ctl_fd, int *running){
         jb_append(&j, "[");
         client_foreach(jb_player, &j);
         jb_append(&j, "]");
+    } else if (strcmp(msg.path, "/dropped-logs") == 0){
+        status = HTTTP_200_OK;
+        jb_append(&j, "{\"ring\": %lu, \"send\": %lu, \"total\": %lu}",
+            ring_dropped(&g_ring), atomic_load(&dropped_send),
+            total_dropped());
     } else if (strcmp(msg.path, "/shutdown") == 0){
         status = HTTTP_200_OK;
         jb_append(&j, "{\"ok\": true, \"shutting_down\": true}");
@@ -786,8 +811,21 @@ static void handle_ctl(int ctl_fd, int *running){
     size_t wlen = 0;
     char *wire = htttp_serialise(&b, &wlen);
     if (wire != NULL){
+        // We ignore SIGPIPE process-wide, so a write to a control client that
+        // has already gone away returns -1 with errno == EPIPE instead of
+        // killing the daemon. That is the whole point of ignoring the signal:
+        // the error becomes an ordinary return value we can inspect. A short
+        // write is reported separately - not an error, but it does mean the
+        // admin saw a truncated reply, so it should not pass silently.
+        // msg is only filled in when the request actually parsed, so on a
+        // parse failure we must not read msg.path.
+        const char *what = (err == HTTTP_OK) ? msg.path : "(unparsed request)";
         ssize_t wr = write(cfd, wire, wlen);
-        (void)wr;                      // a broken pipe here is fine, because we ignore SIGPIPE
+        if (wr < 0)
+            slog("warn", "admin: reply to %s failed: %s", what, strerror(errno));
+        else if ((size_t)wr != wlen)
+            slog("warn", "admin: reply to %s truncated, %zd of %zu bytes",
+                 what, wr, wlen);
         free(wire);
     }
     close(cfd);
@@ -803,7 +841,10 @@ int main(int argc, char **argv){
         fprintf(stderr, "tetrisd: failed to load configuration from %s\n", rc_path);
         return 1;
     }
+    // After the room system is initialized, record the daemon's start time in g_started
     rooms_init(g_cfg.max_rooms, g_cfg.max_players_per_room);
+    clock_gettime(CLOCK_MONOTONIC, &g_started);
+    
 
     // 2. Deal with signals. First we ignore SIGPIPE. We write to network peers
     //    that may disconnect at any time, and without this a write to a peer
@@ -914,23 +955,50 @@ int main(int argc, char **argv){
         }
     }
 
-    // 13. Shut down cleanly. We disconnect every client first, which also
-    //     tears down their rooms and the rooms' game timers, and frees the
-    //     memory for each secure session so there are no leaks.
-    for (int fd = 0; fd < CLIENT_MAX_FD; fd++)
-        if (client_get(fd) != NULL)
-            disconnect_client(fd, "server shutdown");
+    // 13. Shut down cleanly in four phases, with each one being logged
+    // so the sequence is visible in tetrislogd's file afterwards.
+    //
+    // Phase 1: stop accepting. Take the TCP listener out of the epoll set,
+    // then close it. Closing a descriptor DOES remove it from the epoll set
+    // on its own, but only once the last reference to the underlying open
+    // file description goes away, so doing it explicitly first leaves no
+    // window in which the loop could be handed an accept event for a socket
+    // we have already decided to abandon. This is a policy step (take no new
+    // work), not resource cleanup, which is why it lives here and not in the
+    // close() block at the bottom. Redis draws the same line by giving it a
+    // dedicated function, closeListeningSockets() (server.c:4872).
+    epoll_ctl(g_ep, EPOLL_CTL_DEL, listen_fd, NULL);
+    close(listen_fd);
+    slog("info", "tetrisd: phase 1: stopped accepting new clients");
 
-    slog("info", "tetrisd: stopped");
-    // Tell the logshipper thread to stop. It keeps running until the ring is
-    // empty and this flag is set, so joining it here guarantees that the last
-    // log records were sent before we close the socket below.
+    // Phase 2: drain. Disconnecting a client also tears down its room and
+    // that room's game timer, and frees its secure session, so this one loop
+    // reclaims everything the connection owned.
+    int drained = 0;
+    for (int fd = 0; fd < CLIENT_MAX_FD; fd++)
+        if (client_get(fd) != NULL){
+            disconnect_client(fd, "server shutting down");
+            drained++;
+        }
+    slog("info", "tetrisd: phase 2: disconnected %d clients", drained);
+
+    // Phases 3 and 4: flush, then exit. Both records are pushed BEFORE the
+    // shipper is stopped, because the shipper is the only thing that can
+    // deliver them - once it is joined, nothing can be logged any more. So
+    // record 4 describes what is about to happen rather than what already
+    // has. That is unavoidable: the log channel is itself part of what
+    // shutdown tears down.
+    slog("info", "tetrisd: phase 3: flushing log ring");
+    slog("info", "tetrisd: phase 4: closing descriptors and exiting");
+
+    // The shipper exits only once the ring is empty AND the stop flag is set,
+    // so the join below is what guarantees the four records above actually
+    // reached tetrislogd before we close the socket.
     atomic_store(&shipper_stop, 1);
     pthread_join(shipper, NULL);
 
     close(g_ep);
     close(sig_fd);
-    close(listen_fd);
     close(ctl_fd);
     mq_close(mq);
     mq_unlink(g_cfg.garbage_mq);

@@ -12,12 +12,19 @@
 //
 // Each command below turns into a single GET request to a fixed path on
 // tetrisd. Here is what each one does.
-//   status    -> GET /status     returns counters for rooms, players, and
+//   status              -> GET /status     returns counters for rooms, players, and
 //                                 dropped log records
-//   rooms     -> GET /rooms      lists every active room along with how many
+//   rooms               -> GET /rooms      lists every active room along with how many
 //                                 players are in it
-//   players   -> GET /players    lists every player currently connected
-//   shutdown  -> GET /shutdown   asks the daemon to shut down gracefully
+//   players             -> GET /players    lists every player currently connected
+//   dropped-logs        -> GET /dropped-logs  reports log records lost inside
+//                                 tetrisd, split by cause. "ring" means the
+//                                 game path could not hand the record over
+//                                 (trylock failed, or the ring was full), so
+//                                 tetrisd is busier than the shipper. "send"
+//                                 means the shipper's sendto failed, so
+//                                 tetrislogd is dead, slow, or backed up.
+//   shutdown            -> GET /shutdown   asks the daemon to shut down gracefully
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,10 +37,11 @@
 #include "htttp.h"
 
 static const char *command_to_path(const char *cmd){
-    if (strcasecmp(cmd, "status")   == 0) return "/status";
-    if (strcasecmp(cmd, "rooms")    == 0) return "/rooms";
-    if (strcasecmp(cmd, "players")  == 0) return "/players";
-    if (strcasecmp(cmd, "shutdown") == 0) return "/shutdown";
+    if (strcasecmp(cmd, "status")       == 0) return "/status";
+    if (strcasecmp(cmd, "rooms")        == 0) return "/rooms";
+    if (strcasecmp(cmd, "players")      == 0) return "/players";
+    if (strcasecmp(cmd, "dropped-logs") == 0) return "/dropped-logs";
+    if (strcasecmp(cmd, "shutdown")     == 0) return "/shutdown";
     return NULL;
 }
 
@@ -53,7 +61,8 @@ int main(int argc, char **argv){
     const char *path = command_to_path(command);
     if (path == NULL){
         fprintf(stderr, "tetrisctl: unknown command '%s'\n"
-                        "  commands: status | rooms | players | shutdown\n", command);
+                        "  commands: status | rooms | players | dropped-logs | shutdown\n",
+                command);
         return 2;
     }
 
