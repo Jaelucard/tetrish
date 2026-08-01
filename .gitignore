@@ -1,4 +1,11 @@
-# Build artifacts (patterns are unanchored so they match at any depth, e.g. project/)
+# NOTE ON ANCHORING. A pattern with no slash in it (bin/, *.o) matches at any
+# depth. A pattern that contains a slash (auth/server.key, var/log/) is anchored
+# to the directory holding this .gitignore, so it would only match at the repo
+# root and NOT under project/. Every multi-part pattern below therefore starts
+# with **/ so that it matches at any depth as intended. This was a real bug:
+# the key files were not being ignored at all.
+
+# Build artifacts
 bin/
 *.a
 *.o
@@ -8,22 +15,22 @@ build/
 *.dSYM/
 .DS_Store
 # Runtime state
-var/log/
-var/run/
-# Secrets / generated keys
-auth/server.key
-auth/server.crt
-auth/cacsertificate.crt
-auth/ca.key
-auth/ca.srl
-auth/server.csr
+**/var/log/
+**/var/run/
+# Local runtime config. sample.tetrishrc is the committed template; each
+# checkout copies it to .tetrishrc and edits paths/ports locally.
+.tetrishrc
+# Secrets / generated keys. auth/generate_keys.sh IS committed - it is the
+# deliverable that reproduces everything below from scratch.
+**/auth/server.key
+**/auth/server.crt
+**/auth/cacsertificate.crt
+**/auth/ca.key
+**/auth/ca.srl
+**/auth/server.csr
 # Reference repositories (cloned as siblings, not committed)
 application
 networking
 systems
-# Course handout material (kept locally for reference, not part of the deliverable)
-Programming Assignment 1/
-# Unrelated coursework (50.003 ESC repos live alongside; not part of tetriSH)
-ESC/
 # Tooling / harness state
 .omc/
