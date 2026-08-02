@@ -26,6 +26,7 @@ typedef struct {
     int client_timeout;
     int max_clients;
     int max_conns_per_ip;   // Per-IP connection cap, enforced at accept(). 0 disables it.
+    int handshake_budget;   // Handshakes completed per event-loop pass.
     int ctl_perm;
     int tick_hz;
     char log_level[RC_PATHLEN];

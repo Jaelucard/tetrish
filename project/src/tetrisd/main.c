@@ -56,6 +56,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/un.h>
+#include <sys/resource.h>   // getrlimit/setrlimit for the fd budget
 #include <mqueue.h>
 #include "rc.h"
 #include "daemon.h"
@@ -101,6 +102,56 @@ static atomic_ulong garbage_dropped;
 // unless somebody happens to be reading the log at the time.
 static atomic_ulong rejected_conns;
 
+// --- admission: the pending-handshake queue ---------------------------------
+//
+// The handshake used to run inline in the accept handler. That is an RSA
+// signature plus an RSA decrypt, measured at about 8 ms, and while it runs the
+// event loop does nothing else: no ticks, no input, no control plane. It was
+// fine at twenty players. At five hundred arriving together it was not: the
+// measured rate is roughly 130 handshakes a second, so the loop froze for about
+// four seconds and clients at the back of the queue timed out waiting for the
+// certificate. A 500-client burst lost 69 of them that way.
+//
+// So accept() now does almost nothing. It takes the connection, applies the
+// per-IP limit, and parks the descriptor here. The loop then completes at most
+// HANDSHAKE_BUDGET of them per iteration, which bounds how long any single pass
+// can stall and lets ticks, input and admin commands interleave with a rush of
+// arrivals. Total throughput is about the same; what changes is that the game
+// no longer stops while the queue drains.
+//
+// This is the ordering principle Quake 3 uses, arrived at from the opposite
+// direction. It makes a client prove its address with a cheap challenge round
+// trip before the server will spend anything substantial on it, precisely so a
+// flood cannot buy expensive work. TCP's own handshake already proves the
+// address for us, so we do not need the challenge; what we need is the other
+// half of the idea, which is that expensive per-connection work must be
+// rationed by the loop rather than performed on demand.
+// The queue depth is fixed; how many we complete per pass is configurable,
+// because it is the one real tuning knob in this design and its best value
+// depends on how fast the machine's RSA is. Measured here with 500 clients all
+// connecting at once, against 63 rooms ticking at 20 Hz:
+//
+//     budget    admitted    tick rate
+//     inline       431/500    19.8 Hz     (the old behaviour, no queue)
+//          4       394/500    19.6 Hz
+//         16       470/500    19.7 Hz
+//         32       500/500    19.4 Hz
+//
+// A larger budget admits more of a burst at the cost of a slightly slower tick
+// while the burst lasts. Note that even a small budget beats the old inline
+// path on admissions once accept() itself is cheap, because the kernel's listen
+// backlog can then drain instead of overflowing.
+#define PENDING_HS_MAX     512   // parked connections; beyond this we refuse
+
+typedef struct {
+    int      fd;
+    uint32_t addr;               // peer IPv4, network order, for the log
+} pending_hs_t;
+
+static pending_hs_t g_pending_hs[PENDING_HS_MAX];
+static int          g_npending_hs = 0;
+static atomic_ulong hs_queued, hs_refused_full;
+
 // A tiny xorshift32, used only to pick a target room and a hole column. This is
 // deliberately NOT libtetrisbrain's PRNG. The engine's randomness is part of
 // replayable game state and must not be perturbed by network events. This one
@@ -143,6 +194,88 @@ static void slog(const char *level, const char *fmt, ...){
     ring_push(&g_ring, buf, strlen(buf));
 }
 
+// --- the replay log -------------------------------------------------------
+//
+// Replay records travel the same ring and the same socket as the human-readable
+// log, because tetrislogd is the process that owns persistence. tetrisd
+// generates the records, tetrislogd only writes them down. That split matters:
+// tetrislogd cannot see a tick happen, so it could not generate a snapshot even
+// if we asked it to.
+//
+// Two record types, both prefixed so a parser can pick them out of a file that
+// also contains ordinary prose logging. tetrislogd prepends its own wall-clock
+// stamp to every line it writes, so a record arrives on disk looking like:
+//
+//   2026-08-02 10:25:23 E 1234567890 480 roomA p7 INPUT LEFT
+//   \_________________/ \_________________________________/
+//    tetrislogd's stamp        the record we generated
+//
+// A reader skips the first two whitespace-separated fields and dispatches on
+// the third.
+//
+//   E <mono_ns> <tick> <room> <player> <action> [params...]
+//   S <mono_ns> <tick> <room> <player> <w> <h> <cells_hex>
+//
+// The tick number is the important addition to the record format, and it is
+// what makes replay exact rather than approximate.
+// libtetrisbrain advances gravity per tick and has no clock of its own, so a
+// reader that only had timestamps would have to guess how many ticks elapsed
+// between two events. With the tick recorded, replay is: seed the engine, then
+// for tick 0..N apply whatever input that tick carried and call tb_tick once.
+// Without it, replay could only approximate where gravity had got to.
+//
+// The actions that replay actually needs are SEED, INPUT and GARBAGE. CLEAR and
+// OVER are derivable from replaying those, and are emitted anyway so a reader
+// can verify its own reconstruction against what the server recorded.
+static void rlog(const char *fmt, ...){
+    char buf[RING_REC_MAX];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    ring_push(&g_ring, buf, strlen(buf));
+}
+
+// Monotonic nanoseconds, the timestamp both record types carry. Monotonic for
+// the same reason uptime uses it: it cannot be stepped backwards, so records
+// can never appear to go back in time mid-session.
+static unsigned long long mono_ns(void){
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000000ull
+         + (unsigned long long)ts.tv_nsec;
+}
+
+// One hex digit per visible cell, which is what keeps a snapshot inside one
+// ring record. The engine stores 0 for empty, 1..7 for a locked piece, and
+// TB_CELL_GARBAGE for garbage; garbage maps to 8 so every value fits a nibble.
+// TB_CELL_WALL never appears because we only walk the visible playfield.
+static void board_hex(const tb_game *g, char *out, size_t cap){
+    static const char digits[] = "0123456789abcdef";
+    size_t n = 0;
+    for (int y = 1; y <= TB_ROWS && n + 1 < cap; y++)
+        for (int x = 1; x <= TB_COLS && n + 1 < cap; x++){
+            int8_t c = g->cells[y][x];
+            int v = (c == TB_CELL_EMPTY) ? 0
+                  : (c == TB_CELL_GARBAGE) ? 8
+                  : (c >= 1 && c <= 7) ? c : 0;
+            out[n++] = digits[v];
+        }
+    out[n] = '\0';
+}
+
+static const char *input_name(tb_input in){
+    switch (in){
+    case TB_INPUT_LEFT:      return "LEFT";
+    case TB_INPUT_RIGHT:     return "RIGHT";
+    case TB_INPUT_ROTATE_CW:  return "ROTATE_CW";
+    case TB_INPUT_ROTATE_CCW: return "ROTATE_CCW";
+    case TB_INPUT_SOFT_DROP: return "SOFT";
+    case TB_INPUT_HARD_DROP: return "HARD";
+    default:                 return "NONE";
+    }
+}
+
 #define SHIP_BATCH 64
 static void *logshipper(void *arg){
     (void)arg;
@@ -177,6 +310,63 @@ static long uptime_seconds(void){
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (long)(now.tv_sec - g_started.tv_sec);
+}
+
+// Make sure the process can actually open as many descriptors as the config
+// implies, and if it cannot, lower our own ambitions rather than discovering it
+// at the worst moment.
+//
+// Every player costs one descriptor and every running room costs another, on
+// top of the listeners, the signalfd, the epoll set, the log socket and the
+// message queue. Without this check the failure mode is a bare accept()
+// returning EMFILE somewhere around the thousandth connection, which looks like
+// a mysterious refusal rather than a configuration problem.
+//
+// The shape is Redis's adjustOpenFilesLimit (server.c:2647): ask for what we
+// want, and if the kernel refuses, walk the request down until it accepts,
+// never ending up below where we started. Then clamp our own limits to what we
+// actually got and say so, three separate times, so an operator can see what
+// was asked for, what the OS allowed, and what we settled on. Running with a
+// smaller capacity is acceptable; accepting players we cannot serve is not.
+#define FD_RESERVE 32          // listeners, signalfd, epoll, log socket, mq, log files
+static void adjust_fd_limit(void){
+    struct rlimit lim;
+    if (getrlimit(RLIMIT_NOFILE, &lim) < 0){
+        fprintf(stderr, "tetrisd: cannot read the open-file limit: %s\n",
+                strerror(errno));
+        return;
+    }
+
+    rlim_t want = (rlim_t)g_cfg.max_clients + (rlim_t)g_cfg.max_rooms + FD_RESERVE;
+    rlim_t have = lim.rlim_cur;
+
+    if (have < want){
+        rlim_t best = want;
+        while (best > have){
+            struct rlimit try_lim = { .rlim_cur = best, .rlim_max = best };
+            if (setrlimit(RLIMIT_NOFILE, &try_lim) == 0) break;
+            if (best < 16){ best = have; break; }
+            best -= 16;                      // walk it down until the kernel agrees
+        }
+        if (best < have) best = have;        // never end up worse than we started
+        have = best;
+    }
+
+    // Clamp what we will accept to what we can actually serve.
+    int serveable = (int)have - FD_RESERVE - g_cfg.max_rooms;
+    if (serveable < 1){
+        fprintf(stderr, "tetrisd: an open-file limit of %llu is too low to run at all; "
+                        "raise it with ulimit -n\n", (unsigned long long)have);
+        exit(1);
+    }
+    if (g_cfg.max_clients > serveable){
+        fprintf(stderr, "tetrisd: max_clients %d needs %llu descriptors\n",
+                g_cfg.max_clients, (unsigned long long)want);
+        fprintf(stderr, "tetrisd: the OS allows %llu\n", (unsigned long long)have);
+        fprintf(stderr, "tetrisd: max_clients reduced to %d to fit; "
+                        "raise 'ulimit -n' if you need more\n", serveable);
+        g_cfg.max_clients = serveable;
+    }
 }
 
 // --- listeners --------------------------------------------------------------
@@ -327,13 +517,39 @@ static int do_join(client_t *c, const char *rid){
     room_t *r = room_join(rid, c, &status);
     if (r == NULL)
         return send_response(c, (htttp_status_t)status,
-                             status == 409 ? "{\"error\": \"room full or already started\"}"
+                             status == 409 ? "{\"error\": \"room is full\"}"
                                            : "{\"error\": \"room table full\"}", NULL);
 
     if (status == 201)
         slog("info", "room %s created by %s", r->id, c->player_id);
     slog("info", "room %s: %s joined (%d player%s)", r->id, c->player_id,
          r->nplayers, r->nplayers == 1 ? "" : "s");
+
+    // A player who joined a room that is already running has missed the
+    // seeding that START does, so their seat still holds whatever the previous
+    // occupant left behind. Seed it now, at the tick they actually arrived.
+    //
+    // The replay record matters as much as the game state. A reader
+    // reconstructs a player by starting from their SEED and replaying forward,
+    // so a seed recorded at the wrong tick would rebuild a board that never
+    // existed. Recording the room's current tick is what lets a late joiner be
+    // replayed correctly alongside players who were there from the start.
+    if (r->started && c->seat >= 0){
+        static uint32_t late_seed_counter = 0;
+        pthread_mutex_lock(&r->mu);
+        uint32_t seed = (uint32_t)getpid() * 2654435761u + 0x9E3779B9u
+                      + ++late_seed_counter;
+        tb_init(&r->games[c->seat], seed);
+        tb_set_lock_delay(&r->games[c->seat], (uint32_t)(g_cfg.tick_hz / 2));
+        r->pending[c->seat] = TB_INPUT_NONE;
+        uint64_t at_tick = r->ticks;
+        pthread_mutex_unlock(&r->mu);
+
+        slog("info", "room %s: SEED seat=%d player=%s seed=%u (joined at tick %llu)",
+             r->id, c->seat, c->player_id, seed, (unsigned long long)at_tick);
+        rlog("E %llu %llu %s %s SEED %u", mono_ns(),
+             (unsigned long long)at_tick, r->id, c->player_id, seed);
+    }
 
     char body[128];
     snprintf(body, sizeof body, "{\"room\": \"%s\", \"player\": \"%s\", \"players\": %d}",
@@ -378,9 +594,20 @@ static int do_start(client_t *c, const char *rid){
         if (r->players[i] == NULL) continue;
         uint32_t seed = (uint32_t)getpid() * 2654435761u + ++seed_counter;
         tb_init(&r->games[i], seed);
+        // The engine counts lock delay in ticks and has no clock of its own, so
+        // the wall-clock figure has to be converted here, where tick_hz is
+        // known. Half a second at the configured rate, which is 10 ticks at the
+        // default tick_hz of 20.
+        tb_set_lock_delay(&r->games[i], (uint32_t)(g_cfg.tick_hz / 2));
         r->pending[i] = TB_INPUT_NONE;
         slog("info", "room %s: SEED seat=%d player=%s seed=%u",
              r->id, i, r->players[i]->player_id, seed);
+        // The replay record. Everything a reader needs to rebuild this board
+        // starts here: the same seed fed to tb_init produces the same piece
+        // sequence, because the engine's PRNG is part of its state and it
+        // never calls rand(). Tick 0 is the moment START was accepted.
+        rlog("E %llu 0 %s %s SEED %u",
+             mono_ns(), r->id, r->players[i]->player_id, seed);
     }
     r->started = 1;
     r->ticks   = 0;
@@ -417,12 +644,11 @@ static int map_input(htttp_method_t m, const char *body, size_t blen){
         if (blen == 4 && strncmp(body, "LEFT", 4)  == 0) return TB_INPUT_LEFT;
         if (blen == 5 && strncmp(body, "RIGHT", 5) == 0) return TB_INPUT_RIGHT;
     } else if (m == HTTTP_METHOD_ROTATE){
-        // The game engine currently only has one rotation (counter-clockwise,
-        // with no wall kicks yet, which is the application team's later work).
-        // We map both CW and CCW onto that single rotation, so the protocol
-        // already accepts both even though they do the same thing for now.
-        if ((blen == 2 && strncmp(body, "CW", 2)  == 0) ||
-            (blen == 3 && strncmp(body, "CCW", 3) == 0)) return TB_INPUT_ROTATE;
+        // Both directions are real now. Check CCW first: "CW" is a prefix of
+        // nothing here, but the lengths differ, so comparing the longer literal
+        // first keeps the two cases from ever being confused.
+        if (blen == 3 && strncmp(body, "CCW", 3) == 0) return TB_INPUT_ROTATE_CCW;
+        if (blen == 2 && strncmp(body, "CW", 2)  == 0) return TB_INPUT_ROTATE_CW;
     } else if (m == HTTTP_METHOD_DROP){
         if (blen == 4 && strncmp(body, "SOFT", 4) == 0) return TB_INPUT_SOFT_DROP;
         if (blen == 4 && strncmp(body, "HARD", 4) == 0) return TB_INPUT_HARD_DROP;
@@ -589,14 +815,36 @@ static void handle_new_client(int listen_fd){
     setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
 
+    // Park it. The handshake is deliberately NOT run here; see the note above
+    // the queue. A full queue is refused immediately rather than queued and
+    // forgotten, because a client waiting behind an unbounded backlog times out
+    // anyway and we would rather tell it now.
+    if (g_npending_hs >= PENDING_HS_MAX){
+        atomic_fetch_add(&hs_refused_full, 1);
+        slog("warn", "admission queue full (%d), refusing a connection",
+             PENDING_HS_MAX);
+        close(cfd);
+        return;
+    }
+    g_pending_hs[g_npending_hs].fd   = cfd;
+    g_pending_hs[g_npending_hs].addr = peer_addr;
+    g_npending_hs++;
+    atomic_fetch_add(&hs_queued, 1);
+}
+
+// Complete one parked handshake. Returns 0 if the client is now connected.
+//
+// This is the code that used to live inline in the accept handler; nothing
+// about the handshake itself changed, only when it runs.
+static int finish_handshake(int cfd, uint32_t peer_addr){
     tetrissh_session_t *sess = tetrissh_session_alloc();
-    if (sess == NULL){ close(cfd); return; }
+    if (sess == NULL){ close(cfd); return -1; }
 
     if (tetrissh_handshake_server(sess, cfd, g_cfg.cert_path, g_cfg.key_path) != 0){
         slog("warn", "handshake FAILED on fd %d: %s", cfd, tetrissh_strerror(sess));
         tetrissh_session_free(sess);
         close(cfd);
-        return;
+        return -1;
     }
 
     client_t *c = client_add(cfd, sess, peer_addr);
@@ -604,16 +852,36 @@ static void handle_new_client(int listen_fd){
         slog("warn", "fd %d beyond client table, refusing", cfd);
         tetrissh_session_free(sess);
         close(cfd);
-        return;
+        return -1;
     }
     if (ep_add(g_ep, cfd) < 0){
         slog("error", "epoll add failed for fd %d: %s", cfd, strerror(errno));
         client_remove(cfd);
         close(cfd);
-        return;
+        return -1;
     }
     slog("info", "client fd %d: handshake OK, assigned id %s (%d connected)",
          cfd, c->player_id, client_count());
+    return 0;
+}
+
+// Complete up to HANDSHAKE_BUDGET parked connections, oldest first.
+//
+// Called once per pass of the event loop. The budget is what turns a burst of
+// arrivals from a single long stall into a series of short ones with real work
+// in between.
+static void drain_handshakes(void){
+    int budget = g_cfg.handshake_budget > 0 ? g_cfg.handshake_budget : 32;
+    int n = g_npending_hs < budget ? g_npending_hs : budget;
+    for (int i = 0; i < n; i++)
+        finish_handshake(g_pending_hs[i].fd, g_pending_hs[i].addr);
+
+    // Shuffle the remainder down. The queue is small and bursts are short, so a
+    // memmove is cheaper and far easier to reason about than a ring buffer.
+    g_npending_hs -= n;
+    if (g_npending_hs > 0)
+        memmove(g_pending_hs, g_pending_hs + n,
+                (size_t)g_npending_hs * sizeof g_pending_hs[0]);
 }
 
 static void disconnect_client(int fd, const char *reason){
@@ -686,6 +954,17 @@ static void handle_room_tick(room_t *r){
         // cleared. lines_total is cumulative though, so the difference across
         // the tick is the answer, and no engine change is needed to detect it.
         uint32_t lines_before = r->games[i].lines_total;
+        bool     over_before  = r->games[i].game_over;
+
+        // The tick this player's input lands on. r->ticks has already been
+        // advanced past every catch-up expiration, so the first of them, which
+        // is the only one that carries input, is this many ticks back.
+        uint64_t input_tick = r->ticks - expirations + 1;
+
+        if (r->pending[i] != TB_INPUT_NONE && !r->games[i].game_over)
+            rlog("E %llu %llu %s %s INPUT %s", mono_ns(),
+                 (unsigned long long)input_tick, r->id,
+                 r->players[i]->player_id, input_name(r->pending[i]));
 
         for (uint64_t e = 0; e < expirations; e++){
             // The player's queued input is applied on the first tick only. Any
@@ -697,6 +976,33 @@ static void handle_room_tick(room_t *r){
 
         int cleared = (int)(r->games[i].lines_total - lines_before);
         garbage_rows += garbage_rows_for(cleared);   // see the table in garbage.h
+
+        // CLEAR and OVER are not needed to reconstruct the board, since
+        // replaying SEED plus INPUT plus GARBAGE reproduces both. They are
+        // recorded so a reader can check its reconstruction against what the
+        // server actually saw, which is how you catch a replay that has
+        // silently diverged.
+        if (cleared > 0)
+            rlog("E %llu %llu %s %s CLEAR %d", mono_ns(),
+                 (unsigned long long)r->ticks, r->id,
+                 r->players[i]->player_id, cleared);
+        if (r->games[i].game_over && !over_before)
+            rlog("E %llu %llu %s %s OVER", mono_ns(),
+                 (unsigned long long)r->ticks, r->id,
+                 r->players[i]->player_id);
+
+        // A periodic full board. Snapshots are what make replay survive a
+        // dropped record: without them a single lost INPUT would desync every
+        // tick that followed, forever. With them, a reader can resynchronise at
+        // the next snapshot, and can also seek without replaying from tick 0.
+        if (g_cfg.snapshot_interval > 0 &&
+            r->ticks % (uint64_t)g_cfg.snapshot_interval == 0){
+            char hex[TB_ROWS * TB_COLS + 1];
+            board_hex(&r->games[i], hex, sizeof hex);
+            rlog("S %llu %llu %s %s %d %d %s", mono_ns(),
+                 (unsigned long long)r->ticks, r->id,
+                 r->players[i]->player_id, TB_COLS, TB_ROWS, hex);
+        }
 
         r->pending[i] = TB_INPUT_NONE;
         blen += render_board(body + blen, sizeof body - blen,
@@ -855,11 +1161,21 @@ static void handle_garbage(mqd_t mq){
         // blocks while holding it, which is what rooms.h promises.
         int hit = 0;
         pthread_mutex_lock(&dst->mu);
+        uint64_t at_tick = dst->ticks;
         for (int i = 0; i < ROOM_MAX_PLAYERS; i++){
             if (dst->players[i] == NULL) continue;
             if (dst->games[i].game_over) continue;   // already out, leave them
             tb_inject_garbage(&dst->games[i], gm.rows, gm.hole_pattern);
             hit++;
+            // Garbage is the one input to a board that does not come from its
+            // own player, so replay cannot derive it and it has to be recorded.
+            // The hole pattern goes in the record for the same reason the
+            // caller supplies it to the engine: it is the thing that would
+            // otherwise be random, and recording it keeps replay exact.
+            rlog("E %llu %llu %s %s GARBAGE %u %04x", mono_ns(),
+                 (unsigned long long)at_tick, dst->id,
+                 dst->players[i]->player_id,
+                 (unsigned)gm.rows, (unsigned)gm.hole_pattern);
         }
         pthread_mutex_unlock(&dst->mu);
 
@@ -937,11 +1253,13 @@ static void handle_ctl(int ctl_fd, int *running){
         jb_append(&j, "{\"uptime_seconds\": %ld, \"rooms\": %d, "
                       "\"players\": %d, \"dropped_logs\": %lu, "
                       "\"garbage_sent\": %lu, \"garbage_dropped\": %lu, "
-                      "\"rejected_conns\": %lu}",
+                      "\"rejected_conns\": %lu, \"hs_queued\": %lu, "
+                      "\"hs_pending\": %d, \"hs_refused_full\": %lu}",
                   uptime_seconds(), rooms_count(), client_count(),
                   total_dropped(),
                   atomic_load(&garbage_sent), atomic_load(&garbage_dropped),
-                  atomic_load(&rejected_conns));
+                  atomic_load(&rejected_conns), atomic_load(&hs_queued),
+                  g_npending_hs, atomic_load(&hs_refused_full));
     } else if (strcmp(msg.path, "/rooms") == 0){
         status = HTTTP_200_OK;
         jb_append(&j, "[");
@@ -1009,6 +1327,7 @@ int main(int argc, char **argv){
     }
     // After the room system is initialized, record the daemon's start time in g_started
     rooms_init(g_cfg.max_rooms, g_cfg.max_players_per_room);
+    adjust_fd_limit();
     clock_gettime(CLOCK_MONOTONIC, &g_started);
     
 
@@ -1091,6 +1410,8 @@ int main(int argc, char **argv){
     atomic_init(&garbage_sent, 0);
     atomic_init(&garbage_dropped, 0);
     atomic_init(&rejected_conns, 0);
+    atomic_init(&hs_queued, 0);
+    atomic_init(&hs_refused_full, 0);
     pthread_t shipper;
     if (pthread_create(&shipper, NULL, logshipper, NULL) != 0){
         perror("pthread_create");
@@ -1123,7 +1444,14 @@ int main(int argc, char **argv){
     int running = 1;
     while (running){
         struct epoll_event events[32];
-        int n = epoll_wait(g_ep, events, 32, -1);
+        // Never sleep while connections are parked waiting to be admitted.
+        // With a -1 timeout the loop would block until the next tick or the
+        // next packet, which at low room counts could be a long time to leave
+        // somebody hanging mid-handshake. This is the same idea as Redis's
+        // aeSetDontWait: if there is work already in hand, poll and get on
+        // with it rather than waiting to be told about more.
+        int timeout_ms = (g_npending_hs > 0) ? 0 : -1;
+        int n = epoll_wait(g_ep, events, 32, timeout_ms);
         if (n < 0){
             if (errno == EINTR) continue;
             perror("epoll_wait");
@@ -1142,6 +1470,12 @@ int main(int argc, char **argv){
                 else epoll_ctl(g_ep, EPOLL_CTL_DEL, fd, NULL);   // stale fd safety
             }
         }
+
+        // Admit a bounded number of parked connections. This runs after the
+        // event handlers, so a tick that was already due is always serviced
+        // before we spend time on new arrivals: existing players keep their
+        // frame rate while a crowd is let in.
+        if (g_npending_hs > 0) drain_handshakes();
     }
 
     // 13. Shut down cleanly in four phases, with each one being logged

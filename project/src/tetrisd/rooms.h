@@ -26,7 +26,7 @@
 // log ring: copy the data while holding the lock, then do the actual
 // input/output work outside the lock.
 
-// Lock order note for the README. The system now has the ring buffer's
+// Lock ordering. The system now has the ring buffer's
 // mutex, plus one mutex per room. No code path ever holds both of these at
 // the same time, because ring_push is only ever called from outside a room
 // lock's critical section in this design. Even if that changed later, and
@@ -47,10 +47,21 @@
                                // actual runtime cap is cfg->max_players_per_room
                                // and it is checked to make sure it never
                                // exceeds this value.
-#define ROOM_HARD_MAX    32    // This is the compile-time room limit. The
-                               // actual runtime cap is cfg->max_rooms and
-                               // it is checked to make sure it never
-                               // exceeds this value.
+// The compile-time room limit. The actual runtime cap is cfg->max_rooms, which
+// is checked so it can never exceed this.
+//
+// Raised from 32 to 128, because 32 rooms times 8 seats capped the whole server
+// at 256 players no matter how it was configured. At 128 the ceiling is 1024.
+//
+// The cost is a static table of room_t, and a room_t is dominated by its eight
+// tb_game structs at roughly 300 bytes each, so a room is about 2.5 KB and the
+// table is about 320 KB. That is a fair price for the headroom. It is worth
+// contrasting with Quake 3, whose equivalent per-client state runs to ~120 KB
+// plus a snapshot ring costing ~1.6 MB per client slot: scaling that design
+// this way would need most of a gigabyte, which is why its own client limit is
+// a hard 64. Our game state is small enough that the table simply is not the
+// constraint.
+#define ROOM_HARD_MAX    128
 
 typedef struct room {
     int  active;                     // Set to 1 if this slot holds a real room, 0 if the slot is free.

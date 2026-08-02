@@ -31,7 +31,21 @@
 #include <stdatomic.h>
 
 #define RING_CAP     1024   // how many records the ring can hold before it starts dropping
-#define RING_REC_MAX 256    // the largest a single record can be, in bytes (longer ones get cut short)
+// The largest a single record can be, in bytes. Longer ones get cut short.
+//
+// This was 256 until the replay log arrived. A SNAPSHOT record carries the
+// whole visible board as one hex digit per cell, which is TB_ROWS * TB_COLS =
+// 20 * 10 = 200 characters, plus the record type, timestamp, tick, room id,
+// player id and dimensions. That comes to roughly 290 bytes, so 256 would have
+// silently truncated every snapshot and made replay impossible to trust.
+//
+// The cost is memory: RING_CAP * RING_REC_MAX, so 1024 * 512 = 512 KiB of
+// static storage, up from 256 KiB. That is a fair trade for a daemon, and the
+// ring is preallocated precisely so the game path never calls malloc.
+//
+// Still comfortably inside the AF_UNIX datagram size limit, which is what the
+// logshipper's sendto has to fit into.
+#define RING_REC_MAX 512
 
 typedef struct {
     char   rec[RING_CAP][RING_REC_MAX]; // the storage for the records themselves

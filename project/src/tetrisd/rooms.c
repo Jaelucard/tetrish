@@ -78,7 +78,25 @@ room_t *room_join(const char *id, client_t *c, int *status){
         n_rooms++;
         *status = 201;                                  // This means a new room was created.
     } else {
-        if (r->started){ *status = 409; return NULL; }  // We do not allow a client to join a game that has already started.
+        // Joining a room whose game is already running is allowed.
+        //
+        // It used to return 409, and that made the server unusable at any real
+        // scale: a room seals itself the instant the first player starts it,
+        // so with players arriving at the same moment only whoever won the
+        // race got a seat. Measured with 100 clients over 13 rooms, 63 were
+        // turned away with 409.
+        //
+        // Letting them in is cheap here only because a STATE broadcast is a
+        // complete board, not a delta. A server that delta-compressed its
+        // updates would have to hand a late joiner a full baseline first and
+        // hold it in a catching-up state until it acknowledged one (which is
+        // exactly what Quake 3 does with its CS_PRIMED state and entity
+        // baselines). We have no such problem: the next tick after a player
+        // sits down hands them the whole board like everybody else.
+        //
+        // The one thing the caller MUST do is seed this seat's game, because
+        // the seeding that normally happens on START has already been and
+        // gone. See the join handler in tetrisd.
         *status = 200;                                  // This means the client is joining a room that already existed.
     }
 

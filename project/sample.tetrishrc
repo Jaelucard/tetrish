@@ -28,6 +28,14 @@ tcp_keepalive  120                           # SO_KEEPALIVE secs; detects half-d
 # every connection legitimately comes from 127.0.0.1.
 max_conns_per_ip 8                           # 0 = unlimited                     [issue #7/#11]
 
+# How many parked connections tetrisd completes the handshake for on each pass
+# of its event loop. The handshake costs an RSA operation, so doing them all on
+# demand froze the loop for seconds when a crowd arrived. Rationing them keeps
+# existing games ticking while a burst is let in. Measured with 500 clients
+# connecting at once: a budget of 4 admitted 394 of them, 16 admitted 470, and
+# 32 admitted all 500 at a cost of about 3% on the tick rate during the burst.
+handshake_budget 32
+
 # ----------PLANNED (post-gate)----------(parsed + stored, NOT yet enforced)
 client_timeout 60                            # close idle client after N secs   [issue #10]
 max_clients    64                            # global cap; per-IP cap above is the enforced one

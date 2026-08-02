@@ -49,6 +49,7 @@ int rc_load(const char *path, Config *out){
     out->daemonize = false; // bool field
     out->max_clients = 64;
     out->max_conns_per_ip = 8; // per-IP cap at accept(); 0 turns the check off
+    out->handshake_budget = 32; // admissions per event-loop pass; see tetrisd
     out->ctl_perm = 0700; //in octa literal
     strcpy(out->bind_addr, "127.0.0.1"); //strcpy copies the characters in since C doesnt let you assign to array
     out->cert_path[0] = '\0';
@@ -64,7 +65,7 @@ int rc_load(const char *path, Config *out){
     out->max_rooms = 16;
     out->max_players_per_room = 6;
     strcpy(out->garbage_mq, "/tetrish-garbage"); // POSIX mq names must start with '/'
-    // Phase 2: open the file (fail loudly if missing - a daemon with no
+    // Phase 2: open the file (fail loudly if missing, since a daemon with no
     // config must refuse to start, not run on guesses).
     FILE *fp = fopen(path, "r");
     if (fp == NULL) {
@@ -115,6 +116,7 @@ int rc_load(const char *path, Config *out){
         else if (strcmp(key, "client_timeout")       == 0) { if (parse_int(value, 10, &out->client_timeout)       != 0) goto badnum; }
         else if (strcmp(key, "max_clients")          == 0) { if (parse_int(value, 10, &out->max_clients)          != 0) goto badnum; }
         else if (strcmp(key, "max_conns_per_ip")     == 0) { if (parse_int(value, 10, &out->max_conns_per_ip)     != 0) goto badnum; }
+        else if (strcmp(key, "handshake_budget")     == 0) { if (parse_int(value, 10, &out->handshake_budget)     != 0) goto badnum; }
         else if (strcmp(key, "tick_hz")              == 0) { if (parse_int(value, 10, &out->tick_hz)              != 0) goto badnum; }
         else if (strcmp(key, "snapshot_interval")    == 0) { if (parse_int(value, 10, &out->snapshot_interval)    != 0) goto badnum; }
         else if (strcmp(key, "max_rooms")            == 0) { if (parse_int(value, 10, &out->max_rooms)            != 0) goto badnum; }

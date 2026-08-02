@@ -1,4 +1,4 @@
-// This file holds the per-connection client state (Week 6, day 1-2).
+// This file holds the per-connection client state.
 //
 // We keep one client_t for every TCP connection that has finished the secure
 // handshake. The registry is stored as an array indexed by fd, so looking up
