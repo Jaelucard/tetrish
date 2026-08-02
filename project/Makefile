@@ -55,9 +55,11 @@ BINS      := $(addprefix $(BINDIR)/,$(BIN_NAMES))
 
 # --- Test harnesses (built by `make test`) ---
 TEST_BINS := $(BUILDDIR)/tests/test_ring $(BUILDDIR)/tests/stress_ring \
-             $(BUILDDIR)/tests/stub_client
+             $(BUILDDIR)/tests/stub_client $(BUILDDIR)/tests/test_garbage \
+             $(BUILDDIR)/tests/garbage_send
 TEST_OBJ  := $(BUILDDIR)/tests/test_ring.o $(BUILDDIR)/tests/stress_ring.o \
-             $(BUILDDIR)/tests/stub_client.o
+             $(BUILDDIR)/tests/stub_client.o $(BUILDDIR)/tests/test_garbage.o \
+             $(BUILDDIR)/tests/garbage_send.o
 
 # Every object we compile, so we can pull in its generated .d dependency file.
 BIN_OBJ := $(foreach n,$(BIN_NAMES),$(BUILDDIR)/$(n)/main.o)
@@ -140,8 +142,18 @@ $(BUILDDIR)/tests/stress_ring: $(BUILDDIR)/tests/stress_ring.o $(RING_OBJ)
 $(BUILDDIR)/tests/stub_client: $(BUILDDIR)/tests/stub_client.o $(COMMON_OBJ) $(LIB_SSH) $(LIB_HTTTP)
 	$(CC) $(CFLAGS) -o $@ $^ $(SSLLIBS)
 
+# Week-9 Battle Royale. test_garbage is pure logic against libtetrisbrain;
+# garbage_send posts a real event into tetrisd's queue (-lrt for mq_*).
+$(BUILDDIR)/tests/test_garbage: $(BUILDDIR)/tests/test_garbage.o $(LIB_BRAIN)
+	$(CC) $(CFLAGS) -o $@ $^
+
+$(BUILDDIR)/tests/garbage_send: $(BUILDDIR)/tests/garbage_send.o $(COMMON_OBJ)
+	$(CC) $(CFLAGS) -o $@ $^ -lrt
+
 test: $(TEST_BINS)
 	$(BUILDDIR)/tests/test_ring
+	@echo ""
+	$(BUILDDIR)/tests/test_garbage
 	@echo ""
 	@echo "stress harness built: $(BUILDDIR)/tests/stress_ring"
 	@echo "  1. start tetrislogd:  bin/tetrislogd <rc-file>"
