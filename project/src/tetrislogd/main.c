@@ -84,6 +84,41 @@ int main(int argc, char **argv) {
     int sfd = socket(AF_UNIX, SOCK_DGRAM, 0);   // We use SOCK_DGRAM because this socket has no connections, unlike a stream socket.
     if (sfd < 0){ perror("socket"); fclose(log); return 1; }
 
+    // A note on why this socket drops records under load, and why we do not
+    // try to stop it here.
+    //
+    // An AF_UNIX datagram socket's receive queue is bounded by the NUMBER OF
+    // MESSAGES it holds, not by their total size. The bound comes from
+    // net.unix.max_dgram_qlen, which is 10 on this system.
+    //
+    // Measured rather than assumed. Bind a socket, never read from it, and
+    // send until sendto() refuses:
+    //
+    //     payload    1 B, SO_RCVBUF  229376 -> 11 datagrams, then EAGAIN
+    //     payload 4096 B, SO_RCVBUF  229376 -> 11 datagrams, then EAGAIN
+    //     payload    1 B, SO_RCVBUF 2097152 -> 11 datagrams, then EAGAIN
+    //     payload 4096 B, SO_RCVBUF 2097152 -> 11 datagrams, then EAGAIN
+    //
+    // A one-byte and a four-kilobyte payload stop at the same count, so the
+    // limit is messages. Eleven get through against a limit of ten, so the
+    // kernel's test is "queue length greater than the limit", not "greater or
+    // equal". And raising SO_RCVBUF nine-fold changes nothing, so SO_RCVBUF
+    // (which caps bytes) does not govern this at all. Raising it here was
+    // tried and reverted for exactly that reason.
+    //
+    // We retire records with one fprintf plus one fflush each, which is a
+    // write() syscall per line. That is deliberate, so a crash cannot lose
+    // lines still sitting in a stdio buffer. It does mean that when tetrisd
+    // bursts more than ten records faster than we can write them, the eleventh
+    // is refused and tetrisd's non-blocking sendto fails.
+    //
+    // That is the designed behaviour, not a fault. tetrisd counts every such
+    // loss in its "send" drop counter, visible through `tetrisctl
+    // dropped-logs`, and gameplay never waits on logging. Measured: a single
+    // client produces zero drops; ten rooms all disconnecting at once produces
+    // a handful. The alternative, making the game block until the logger
+    // catches up, would trade a few lost log lines for a stalled tick.
+
     // Here we build the socket address from the log_ipc path in the config.
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof addr);
