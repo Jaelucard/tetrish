@@ -94,9 +94,99 @@ bool tb_block_fits(const tb_game *g, const tb_block *b)
     return true;
 }
 
+// SRS wall kicks
+//
+// A plain rotation often fails next to a wall or a stack. SRS says: do not give
+// up, try the rotation again at up to four nearby offsets and take the first
+// that fits. That is what lets a piece "kick" off a wall, and it is what makes
+// T-spins possible.
+//
+// These tables are specification data from the Super Rotation System, not
+// something derived here. Five tests per transition, the first always (0,0)
+// which is the plain rotation.
+//
+// ONE CONVERSION MATTERS. The published tables use a y axis that points UP, so
+// their +1 means up and -2 means down two. This engine's y points DOWN: row 1
+// is the top of the playfield and move_block advances origin.y to fall. So
+// every y value below is negated when it is applied. Get this wrong and the
+// kicks push pieces through the floor instead of off the wall.
+//
+// Indexed by the orientation being rotated FROM. The O piece never kicks: all
+// four of its orientations are identical, so a rotation that fits at (0,0)
+// always fits, and one that does not cannot be helped by an offset.
+typedef struct { int8_t dx, dy; } tb_kick;
+
+static const tb_kick kicks_JLSTZ_cw[TB_NUM_ORIENTATIONS][5] = {
+    /* 0 -> R */ {{0,0}, {-1,0}, {-1,+1}, {0,-2}, {-1,-2}},
+    /* R -> 2 */ {{0,0}, {+1,0}, {+1,-1}, {0,+2}, {+1,+2}},
+    /* 2 -> L */ {{0,0}, {+1,0}, {+1,+1}, {0,-2}, {+1,-2}},
+    /* L -> 0 */ {{0,0}, {-1,0}, {-1,-1}, {0,+2}, {-1,+2}},
+};
+static const tb_kick kicks_JLSTZ_ccw[TB_NUM_ORIENTATIONS][5] = {
+    /* 0 -> L */ {{0,0}, {+1,0}, {+1,+1}, {0,-2}, {+1,-2}},
+    /* R -> 0 */ {{0,0}, {+1,0}, {+1,-1}, {0,+2}, {+1,+2}},
+    /* 2 -> R */ {{0,0}, {-1,0}, {-1,+1}, {0,-2}, {-1,-2}},
+    /* L -> 2 */ {{0,0}, {-1,0}, {-1,-1}, {0,+2}, {-1,+2}},
+};
+// The I piece is long enough that it needs its own, wider offsets.
+static const tb_kick kicks_I_cw[TB_NUM_ORIENTATIONS][5] = {
+    /* 0 -> R */ {{0,0}, {-2,0}, {+1,0}, {-2,-1}, {+1,+2}},
+    /* R -> 2 */ {{0,0}, {-1,0}, {+2,0}, {-1,+2}, {+2,-1}},
+    /* 2 -> L */ {{0,0}, {+2,0}, {-1,0}, {+2,+1}, {-1,-2}},
+    /* L -> 0 */ {{0,0}, {+1,0}, {-2,0}, {+1,-2}, {-2,+1}},
+};
+static const tb_kick kicks_I_ccw[TB_NUM_ORIENTATIONS][5] = {
+    /* 0 -> L */ {{0,0}, {-1,0}, {+2,0}, {-1,+2}, {+2,-1}},
+    /* R -> 0 */ {{0,0}, {+2,0}, {-1,0}, {+2,+1}, {-1,-2}},
+    /* 2 -> R */ {{0,0}, {+1,0}, {-2,0}, {+1,-2}, {-2,+1}},
+    /* L -> 2 */ {{0,0}, {-2,0}, {+1,0}, {-2,-1}, {+1,+2}},
+};
+
 // move, rotate, and drop functions
 
-typedef enum { MV_LEFT, MV_RIGHT, MV_DOWN, MV_DROP, MV_ROTATE } tb_action;
+typedef enum { MV_LEFT, MV_RIGHT, MV_DOWN, MV_DROP,
+               MV_ROTATE_CW, MV_ROTATE_CCW } tb_action;
+
+// Is the piece resting on something? Used by the lock delay. Trying the move on
+// a copy rather than committing it keeps this side-effect free.
+static bool is_grounded(const tb_game *g)
+{
+    tb_block nb = g->active;
+    nb.origin.y++;                       // at most one row outside the play
+    return !tb_block_fits(g, &nb);       // area, which the sentinel border covers
+}
+
+static bool try_rotate(tb_game *g, bool clockwise)
+{
+    tb_block nb = g->active;
+    uint8_t from = (uint8_t)(nb.orientation % TB_NUM_ORIENTATIONS);
+    nb.orientation = clockwise
+        ? (uint8_t)((from + 1) % TB_NUM_ORIENTATIONS)
+        : (uint8_t)((from + TB_NUM_ORIENTATIONS - 1) % TB_NUM_ORIENTATIONS);
+
+    // The O piece is rotationally symmetric in this shape table, so kicking it
+    // would only shove it sideways for no visual reason.
+    if (g->active.type == TB_O) {
+        if (!tb_block_fits(g, &nb)) return false;
+        g->active = nb;
+        return true;
+    }
+
+    const tb_kick (*table)[5] = (g->active.type == TB_I)
+        ? (clockwise ? kicks_I_cw : kicks_I_ccw)
+        : (clockwise ? kicks_JLSTZ_cw : kicks_JLSTZ_ccw);
+
+    for (int t = 0; t < 5; t++) {
+        tb_block cand = nb;
+        cand.origin.x = (int8_t)(cand.origin.x + table[from][t].dx);
+        cand.origin.y = (int8_t)(cand.origin.y - table[from][t].dy);  // y is flipped
+        if (tb_block_fits(g, &cand)) {
+            g->active = cand;
+            return true;
+        }
+    }
+    return false;                        // all five tests blocked
+}
 
 static bool move_block(tb_game *g, tb_action a)
 {
@@ -110,12 +200,10 @@ static bool move_block(tb_game *g, tb_action a)
         nb.origin.y--;                              // back off one row
         g->active = nb;                             // a drop always commits
         return true;
-    case MV_ROTATE:
-        nb.orientation = (uint8_t)((nb.orientation + TB_NUM_ORIENTATIONS - 1)
-                                   % TB_NUM_ORIENTATIONS);  // counter-clockwise
-        break;
+    case MV_ROTATE_CW:  return try_rotate(g, true);
+    case MV_ROTATE_CCW: return try_rotate(g, false);
     }
-    if (!tb_block_fits(g, &nb)) return false;       // add wall kicks/srs shit here eventually
+    if (!tb_block_fits(g, &nb)) return false;
     g->active = nb;
     return true;
 }
@@ -233,6 +321,10 @@ static void lock_and_next(tb_game *g)
     if (rows) score_lines(g, rows);
     tb_spawn(g, next_from_bag(g));
     g->ticks_since_grav = 0;
+    // The new piece gets a fresh allowance. Carrying the old piece's spent
+    // resets over would make the second piece in a stack lock almost instantly.
+    g->lock_timer  = 0;
+    g->lock_resets = 0;
 }
 
 // game cycle (idk what else to call it lol)
@@ -245,7 +337,15 @@ void tb_init(tb_game *g, uint32_t seed)
     g->gravity_period = TB_GRAVITY_INITIAL;
     g->rng_state      = seed ? seed : 0x9E3779B9u;  // xorshift32 must be != 0
     g->bag_index      = TB_NUM_PIECES;              // force refill on first draw
+    g->lock_delay_ticks = TB_LOCK_DELAY_TICKS;      // 500 ms at tick_hz 20
     tb_spawn(g, next_from_bag(g));
+}
+
+void tb_set_lock_delay(tb_game *g, uint32_t ticks)
+{
+    g->lock_delay_ticks = ticks;
+    g->lock_timer       = 0;
+    g->lock_resets      = 0;
 }
 
 bool tb_tick(tb_game *g, tb_input input)
@@ -253,25 +353,58 @@ bool tb_tick(tb_game *g, tb_input input)
     if (g->game_over) return false;
     g->tick_count++;
 
+    bool moved = false;                  // did the player successfully act?
     switch (input) {
-    case TB_INPUT_NONE:                                  break;
-    case TB_INPUT_LEFT:   move_block(g, MV_LEFT);        break;
-    case TB_INPUT_RIGHT:  move_block(g, MV_RIGHT);       break;
-    case TB_INPUT_ROTATE: move_block(g, MV_ROTATE);      break;
+    case TB_INPUT_NONE:                                          break;
+    case TB_INPUT_LEFT:       moved = move_block(g, MV_LEFT);       break;
+    case TB_INPUT_RIGHT:      moved = move_block(g, MV_RIGHT);      break;
+    case TB_INPUT_ROTATE_CW:  moved = move_block(g, MV_ROTATE_CW);  break;
+    case TB_INPUT_ROTATE_CCW: moved = move_block(g, MV_ROTATE_CCW); break;
     case TB_INPUT_SOFT_DROP:
-        if (move_block(g, MV_DOWN)) g->ticks_since_grav = 0;
-        else                        lock_and_next(g);
-        return !g->game_over;
+        // A soft drop nudges the piece down but no longer locks it on contact.
+        // Locking is the lock delay's job now, which is what gives the player
+        // the grace period to slide it at the last moment.
+        if (move_block(g, MV_DOWN)) { g->ticks_since_grav = 0; moved = true; }
+        break;
     case TB_INPUT_HARD_DROP:
+        // A hard drop is the one input that deliberately skips lock delay.
+        // Slamming a piece down is a commitment.
         move_block(g, MV_DROP);
         lock_and_next(g);
         return !g->game_over;
     }
 
     // tick-driven gravity: step down once every gravity_period ticks.
+    // Failing to move down no longer locks immediately; being unable to fall is
+    // simply what "grounded" means, and the lock delay below decides when that
+    // becomes a lock.
     if (++g->ticks_since_grav >= g->gravity_period) {
         g->ticks_since_grav = 0;
-        if (!move_block(g, MV_DOWN)) lock_and_next(g);
+        move_block(g, MV_DOWN);
+    }
+
+    // Lock delay, move-reset rule.
+    //
+    // While the piece is resting on something, a timer runs. Moving or rotating
+    // restarts it, so a player can shuffle a piece into place instead of losing
+    // it the instant it touches down. The restart is capped, otherwise a player
+    // could hold a piece up forever and the game would never progress. Once the
+    // cap is reached the timer keeps running and the piece locks on schedule.
+    if (g->lock_delay_ticks == 0) {
+        // Lock delay disabled: behave the old way and lock on contact.
+        if (is_grounded(g)) lock_and_next(g);
+    } else if (is_grounded(g)) {
+        if (moved && g->lock_resets < TB_LOCK_MAX_RESETS) {
+            g->lock_timer = 0;
+            g->lock_resets++;
+        }
+        if (++g->lock_timer >= g->lock_delay_ticks)
+            lock_and_next(g);
+    } else {
+        // Airborne again, whether from a kick that lifted the piece or from the
+        // stack falling away beneath it. The allowance refreshes.
+        g->lock_timer  = 0;
+        g->lock_resets = 0;
     }
     return !g->game_over;
 }

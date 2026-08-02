@@ -50,6 +50,19 @@
 #define TB_GRAVITY_DELTA    4u
 #define TB_LINES_PER_LEVEL 10u
 
+/* Lock delay, using the move-reset rule: once a piece is resting on something,
+ * it gets a grace period before it locks, and moving or rotating it restarts
+ * that period. Without a cap a player could hold a piece in place forever, so
+ * the number of restarts is limited.
+ *
+ * The delay is counted in TICKS, not milliseconds, because this library has no
+ * clock. The target is 500 ms, which is 10 ticks at the default
+ * tick_hz of 20. The caller decides: tetrisd calls tb_set_lock_delay with
+ * tick_hz / 2 so the wall-clock feel stays at half a second whatever the
+ * configured tick rate. */
+#define TB_LOCK_DELAY_TICKS 10u   /* 500 ms at tick_hz 20 */
+#define TB_LOCK_MAX_RESETS  15u
+
 // piece order: O, I, T, S, Z, J, L. This indexes the shape table.
 typedef enum {
     TB_O, TB_I, TB_T, TB_S, TB_Z, TB_J, TB_L
@@ -59,7 +72,8 @@ typedef enum {
     TB_INPUT_NONE,
     TB_INPUT_LEFT,
     TB_INPUT_RIGHT,
-    TB_INPUT_ROTATE,     // counter-clockwise; no wall kicks yet
+    TB_INPUT_ROTATE_CCW,   // both directions now exist, and both try SRS kicks
+    TB_INPUT_ROTATE_CW,
     TB_INPUT_SOFT_DROP,
     TB_INPUT_HARD_DROP
 } tb_input;
@@ -90,7 +104,11 @@ typedef struct {
     uint32_t ticks_since_grav;
     uint64_t tick_count;
 
-    uint32_t rng_state;          // xorshift32 — part of the game state
+    uint32_t lock_delay_ticks;   // grace period once the piece is resting
+    uint32_t lock_timer;         // ticks spent resting since the last reset
+    uint8_t  lock_resets;        // how many times the player has restarted it
+
+    uint32_t rng_state;          // xorshift32, part of the game state
     uint8_t  bag[TB_NUM_PIECES];
     uint8_t  bag_index;
 } tb_game;
@@ -100,6 +118,14 @@ extern const tb_position tb_positions[TB_NUM_PIECES][TB_NUM_ORIENTATIONS];
 // Initialize a game in-place with the given seed and spawn the first piece.
 // If seed is 0, a default nonzero seed is used.
 void tb_init(tb_game *g, uint32_t seed);
+
+/* Set the lock delay in ticks. tb_init leaves it at TB_LOCK_DELAY_TICKS, which
+ * is correct for tick_hz 20; a caller running a different tick rate should pass
+ * tick_hz / 2 to keep the wall-clock delay at 500 ms. Passing 0 disables lock
+ * delay entirely, which restores the older behaviour of locking the instant
+ * gravity cannot move the piece down. */
+void tb_set_lock_delay(tb_game *g, uint32_t ticks);
+
 bool tb_tick(tb_game *g, tb_input input);
 void tb_spawn(tb_game *g, tb_piece_type type);
 bool tb_block_fits(const tb_game *g, const tb_block *b);
