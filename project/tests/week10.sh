@@ -1,5 +1,5 @@
 #!/bin/sh
-# week10.sh - Battle Royale under load, per-IP limit, and room/timerfd cleanup.
+# week10.sh: Battle Royale under load, per-IP limit, and room/timerfd cleanup.
 #
 # Three things are checked, and the third is the one that needs measuring
 # rather than asserting:

@@ -1,8 +1,8 @@
 #!/bin/sh
-# gate8.sh - reproducible evidence for the Week-8 baseline MVP gate.
+# gate8.sh: reproducible evidence that the baseline MVP works end to end.
 #
 # Runs the whole daemon stack, drives it with two concurrent stub clients in
-# separate rooms, and checks every gate claim mechanically. No TTY needed, so
+# separate rooms, and checks every claim below mechanically. No TTY needed, so
 # it also runs under valgrind (pass --valgrind).
 #
 # Usage:  sh tests/gate8.sh [--valgrind]

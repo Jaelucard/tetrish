@@ -11,7 +11,7 @@ CC       := gcc
 # layout) rather than in include/; tetrisd's rooms module includes it.
 # (Literal path, not $(SRCDIR): CFLAGS uses := which expands IMMEDIATELY,
 # and SRCDIR is defined further down - $(SRCDIR) here would be empty.)
-CFLAGS   := -Wall -Wextra -g -pthread -I include -I src/libtetrisbrain
+CFLAGS   := -D_GNU_SOURCE -Wall -Wextra -g -pthread -I include -I src/libtetrisbrain
 # OpenSSL: libtetrissh uses the EVP API, so every binary that links it needs
 # libssl/libcrypto at the END of the link line (static .a resolution order).
 SSLLIBS  := -lssl -lcrypto
@@ -56,10 +56,12 @@ BINS      := $(addprefix $(BINDIR)/,$(BIN_NAMES))
 # --- Test harnesses (built by `make test`) ---
 TEST_BINS := $(BUILDDIR)/tests/test_ring $(BUILDDIR)/tests/stress_ring \
              $(BUILDDIR)/tests/stub_client $(BUILDDIR)/tests/test_garbage \
-             $(BUILDDIR)/tests/garbage_send
+             $(BUILDDIR)/tests/garbage_send $(BUILDDIR)/tests/test_htttp \
+             $(BUILDDIR)/tests/fuzz_htttp
 TEST_OBJ  := $(BUILDDIR)/tests/test_ring.o $(BUILDDIR)/tests/stress_ring.o \
              $(BUILDDIR)/tests/stub_client.o $(BUILDDIR)/tests/test_garbage.o \
-             $(BUILDDIR)/tests/garbage_send.o
+             $(BUILDDIR)/tests/garbage_send.o $(BUILDDIR)/tests/test_htttp.o \
+             $(BUILDDIR)/tests/fuzz_htttp.o
 
 # Every object we compile, so we can pull in its generated .d dependency file.
 BIN_OBJ := $(foreach n,$(BIN_NAMES),$(BUILDDIR)/$(n)/main.o)
@@ -117,13 +119,20 @@ $(BINDIR)/tetrisctl: $(BUILDDIR)/tetrisctl/main.o $(COMMON_OBJ) $(LIB_HTTTP)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -o $@ $^
 
-$(BINDIR)/tetrisu: $(BUILDDIR)/tetrisu/main.o
+# tetrisu links the session layer, the protocol and ncurses, but deliberately
+# NOT libtetrisbrain: the server is authoritative and sends the finished board,
+# so the client holds no game state and cannot disagree with it.
+$(BINDIR)/tetrisu: $(BUILDDIR)/tetrisu/main.o $(COMMON_OBJ) $(LIB_SSH) $(LIB_HTTTP)
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) -o $@ $^ $(SSLLIBS) -lncurses
 
-$(BINDIR)/tetrish-view: $(BUILDDIR)/tetrish-view/main.o
+# tetrish-view replays a recorded session, so it links the game engine (it
+# reconstructs boards by calling tb_tick, the same entry point tetrisd uses)
+# and ncurses for rendering. It needs no sockets and no crypto: it reads a log
+# file, nothing more.
+$(BINDIR)/tetrish-view: $(BUILDDIR)/tetrish-view/main.o $(LIB_BRAIN)
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) -o $@ $^ -lncurses
 
 # --- Tests ---
 # Test sources live in tests/ (not src/), so they get their own compile rule.
@@ -150,10 +159,22 @@ $(BUILDDIR)/tests/test_garbage: $(BUILDDIR)/tests/test_garbage.o $(LIB_BRAIN)
 $(BUILDDIR)/tests/garbage_send: $(BUILDDIR)/tests/garbage_send.o $(COMMON_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ -lrt
 
+# Edge-case tests for the protocol library. Pure parsing, no sockets.
+$(BUILDDIR)/tests/test_htttp: $(BUILDDIR)/tests/test_htttp.o $(LIB_HTTTP)
+	$(CC) $(CFLAGS) -o $@ $^
+
+# Malformed-input fuzzer for the parser. -D_GNU_SOURCE for memmem().
+$(BUILDDIR)/tests/fuzz_htttp: $(BUILDDIR)/tests/fuzz_htttp.o $(LIB_HTTTP)
+	$(CC) $(CFLAGS) -o $@ $^
+
 test: $(TEST_BINS)
 	$(BUILDDIR)/tests/test_ring
 	@echo ""
 	$(BUILDDIR)/tests/test_garbage
+	@echo ""
+	$(BUILDDIR)/tests/test_htttp
+	@echo ""
+	$(BUILDDIR)/tests/fuzz_htttp 20000
 	@echo ""
 	@echo "stress harness built: $(BUILDDIR)/tests/stress_ring"
 	@echo "  1. start tetrislogd:  bin/tetrislogd <rc-file>"

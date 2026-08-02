@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libssl-dev \
       libncurses-dev \
       valgrind \
+      tcpdump \
       gdb strace lsof \
       git ca-certificates \
  && rm -rf /var/lib/apt/lists/*

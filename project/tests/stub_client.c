@@ -1,4 +1,4 @@
-// stub_client is our Week 6 integration test harness for the whole tetrisd
+// stub_client is the integration test harness for the whole tetrisd
 // pipeline, end to end.
 //
 // It walks through the full flow a real client would use. First it makes a
@@ -101,6 +101,22 @@ int main(int argc, char **argv){
         perror("connect"); return 1;
     }
 
+    // Bound every blocking read and write on this socket.
+    //
+    // libtetrissh receives with an MSG_WAITALL loop, so without a timeout a
+    // client whose server disappears mid-frame waits forever. That was not
+    // theoretical: a 200-client run measured 366 seconds of wall clock for
+    // what were 3-second sessions, because one straggler hung after the daemon
+    // was killed and the harness waits for every child. A stress harness that
+    // can hang indefinitely reports meaningless timings, which is worse than
+    // one that fails.
+    //
+    // Five seconds matches what tetrisd allows its own peers and what tetrisu
+    // sets on this same library.
+    struct timeval io_to = { .tv_sec = 5, .tv_usec = 0 };
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &io_to, sizeof io_to);
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &io_to, sizeof io_to);
+
     // Now we run the client side of the handshake, which checks the server's certificate against our CA.
     sess = tetrissh_session_alloc();
     if (tetrissh_handshake_client(sess, sockfd, cfg.ca_path) != 0){
@@ -128,11 +144,17 @@ int main(int argc, char **argv){
     player_id[vlen] = '\0';
     printf("ok  JOIN -> %d, issued Player-Id: %s\n", st, player_id);
 
-    // We send START and expect a 200 status. This arms the room's ticker.
+    // We send START, which arms the room's ticker.
+    //
+    // 200 means we started it. 409 means somebody already had, which is just
+    // as good: the ticker we needed is running either way. Only the first
+    // client into a room can ever get 200, so treating 409 as fatal would make
+    // it impossible for this harness to put more than one player in a room,
+    // and multi-player rooms are exactly what a load test needs to exercise.
     if (send_request(HTTTP_METHOD_START, path, player_id, NULL) != 0) return 1;
     st = read_until_response(&msg, keep, sizeof keep);
-    if (st != 200){ fprintf(stderr, "FAIL START -> %d\n", st); return 1; }
-    printf("ok  START -> 200\n");
+    if (st != 200 && st != 409){ fprintf(stderr, "FAIL START -> %d\n", st); return 1; }
+    printf("ok  START -> %d%s\n", st, st == 409 ? " (already running, joined it)" : "");
 
     // Now we receive STATE frames for the given number of seconds, and partway through we send a MOVE.
     // We use CLOCK_MONOTONIC here instead of time(), because time() only has
