@@ -1,4 +1,4 @@
-// Main REPL for tetrish - the launcher/control shell for the tetriSH system.
+// Main REPL for tetrish, the launcher/control shell for the tetriSH system.
 #include <stdio.h> // standard input/output functions
 #include <stdlib.h> // standard library functions
 #include <string.h> // string manipualtion functions
@@ -274,7 +274,7 @@ static int launch(char **argv){
   }
   // PARENT: reap the child so it does not linger as a zombie.
   // The EINTR loop matters now that SIGINT has NO SA_RESTART: Ctrl+C aimed
-  // at the foreground child interrupts OUR waitpid too - without the retry
+  // at the foreground child interrupts OUR waitpid too. Without the retry
   // we would abandon the child (zombie + shell prompt fighting the child
   // for the terminal).
   int status;

@@ -2,8 +2,8 @@
 // socket (the ctl_path from the config file), sends a single HTTTP request,
 // prints the response body, and then exits.
 //
-// As of week 6, the control plane speaks real HTTTP through libhtttp instead
-// of the small placeholder line protocol we used back in weeks 4 and 5. This
+// The control plane speaks real HTTTP through libhtttp, replacing an earlier
+// placeholder line protocol. This
 // channel carries plain HTTTP text over a local AF_UNIX socket. Only
 // processes on this same machine can reach that socket, so normal filesystem
 // permissions are enough to control who can connect. That is why we do not
