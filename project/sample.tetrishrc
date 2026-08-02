@@ -20,9 +20,17 @@ bind           127.0.0.1                     # interface to listen on; loopback-
 tcp_backlog    128                           # listen() backlog depth
 tcp_keepalive  120                           # SO_KEEPALIVE secs; detects half-dead clients
 
+# Per-IP connection cap, ENFORCED at accept() before the handshake runs. The
+# ordering matters: the handshake costs an RSA signature, so a connect flood
+# from one host would be cheap to send and expensive to serve. Rejections are
+# logged at warn level and counted in `tetrisctl status` as rejected_conns.
+# Set to 0 to disable, which is what you want for a local stress test where
+# every connection legitimately comes from 127.0.0.1.
+max_conns_per_ip 8                           # 0 = unlimited                     [issue #7/#11]
+
 # ----------PLANNED (post-gate)----------(parsed + stored, NOT yet enforced)
 client_timeout 60                            # close idle client after N secs   [issue #10]
-max_clients    64                            # reject past this at accept()      [issue #7/#11]
+max_clients    64                            # global cap; per-IP cap above is the enforced one
 ctl_perm       0700                          # octal perms on ctl_path socket   (parse base 8!)
 
 # --------GAME----------(optional tunables)

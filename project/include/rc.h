@@ -25,6 +25,7 @@ typedef struct {
     int tcp_keepalive;
     int client_timeout;
     int max_clients;
+    int max_conns_per_ip;   // Per-IP connection cap, enforced at accept(). 0 disables it.
     int ctl_perm;
     int tick_hz;
     char log_level[RC_PATHLEN];

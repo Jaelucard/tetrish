@@ -16,6 +16,7 @@
 #ifndef CLIENTS_H
 #define CLIENTS_H
 
+#include <stdint.h>
 #include "tetrissh.h"
 
 #define CLIENT_MAX_FD    4096   // This is the upper bound for the registry array. Any fd at or above this value is refused.
@@ -27,12 +28,21 @@ typedef struct client {
     char player_id[CLIENT_ID_MAX];   // The player id the server assigned to this client, for example "p7".
     int room;                        // The index of this client's room in the room table. A value of -1 means the client is in the lobby.
     int seat;                        // The seat index for this client inside its room. A value of -1 means no seat has been assigned.
+    uint32_t addr;                   // The peer's IPv4 address in network byte order, used by the per-IP connection limit.
 } client_t;
 
 // Registers a connection that has just finished its handshake. It returns a
 // pointer to the new slot, or NULL if the fd is out of range. If it returns
 // NULL, the caller should close the connection.
-client_t *client_add(int fd, tetrissh_session_t *sess);
+client_t *client_add(int fd, tetrissh_session_t *sess, uint32_t addr);
+
+// Counts how many connected clients came from this address. The per-IP limit
+// calls this at accept() time, before anything expensive happens. The registry
+// is a flat array of CLIENT_MAX_FD slots, so this is a linear scan. That is
+// fine here: it runs once per connection attempt, not per request, and the
+// alternative (a hash table keyed by address) would be more state to keep
+// correct on every disconnect for no measurable gain at this scale.
+int client_count_addr(uint32_t addr);
 
 // Looks up a client by fd in constant time (O(1)). Returns NULL if no client is stored at that fd.
 client_t *client_get(int fd);

@@ -18,7 +18,7 @@ static void ensure_init(void){
     initialised = 1;
 }
 
-client_t *client_add(int fd, tetrissh_session_t *sess){
+client_t *client_add(int fd, tetrissh_session_t *sess, uint32_t addr){
     ensure_init();
     if (fd < 0 || fd >= CLIENT_MAX_FD)
         return NULL;
@@ -27,6 +27,7 @@ client_t *client_add(int fd, tetrissh_session_t *sess){
     c->sess = sess;
     c->room = -1;
     c->seat = -1;
+    c->addr = addr;
     // This is the identity the server assigns and ties to this connection.
     // The fd is unique among all connections that are currently alive, and
     // that is the only uniqueness guarantee we need here.
@@ -53,6 +54,15 @@ void client_remove(int fd){
 
 int client_count(void){
     return n_clients;
+}
+
+int client_count_addr(uint32_t addr){
+    ensure_init();
+    int n = 0;
+    for (int i = 0; i < CLIENT_MAX_FD; i++)
+        if (table[i].fd != -1 && table[i].addr == addr)
+            n++;
+    return n;
 }
 
 void client_foreach(void (*fn)(client_t *c, void *arg), void *arg){

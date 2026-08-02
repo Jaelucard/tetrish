@@ -95,6 +95,12 @@ static mqd_t g_mq = (mqd_t)-1;
 static atomic_ulong garbage_sent;
 static atomic_ulong garbage_dropped;
 
+// Connections refused at accept() by the per-IP limit. Redis keeps the same
+// counter for the same reason and reports it as rejected_connections in INFO
+// (server.h:2132, networking.c:1679). Without it, a rejection is invisible
+// unless somebody happens to be reading the log at the time.
+static atomic_ulong rejected_conns;
+
 // A tiny xorshift32, used only to pick a target room and a hole column. This is
 // deliberately NOT libtetrisbrain's PRNG. The engine's randomness is part of
 // replayable game state and must not be perturbed by network events. This one
@@ -540,8 +546,42 @@ static void handle_client_data(int fd){
 // --- the accept path ------------------------------------------------------------
 
 static void handle_new_client(int listen_fd){
-    int cfd = accept(listen_fd, NULL, NULL);
+    // We ask accept() for the peer address, because the per-IP limit below
+    // needs it. Passing NULL here (as this did before) simply discards it.
+    struct sockaddr_in peer;
+    socklen_t peerlen = sizeof peer;
+    int cfd = accept(listen_fd, (struct sockaddr *)&peer, &peerlen);
     if (cfd < 0) return;
+
+    // Per-IP admission control. This happens BEFORE the handshake, and the
+    // ordering is the whole point of the check rather than an optimisation.
+    // tetrissh_handshake_server does an RSA signature, so every connection we
+    // let through costs real CPU before the peer has proved anything at all.
+    // A connect flood from one host would otherwise be cheap for the attacker
+    // and expensive for us. Redis makes the same argument in
+    // acceptCommonHandler (networking.c:1658): "Admission control will happen
+    // before a client is created and connAccept() called, because we don't
+    // want to even start transport-level negotiation if rejected."
+    //
+    // We close without sending anything back. There is no way to send a
+    // meaningful error yet, because the session that would encrypt it does not
+    // exist until the handshake completes. Redis notes the identical situation
+    // for its TLS listeners: "no handshake was done yet so nothing is written
+    // and the connection will just drop."
+    //
+    // 0 disables the limit, which is what you want for a local stress test
+    // where every connection legitimately comes from 127.0.0.1.
+    uint32_t peer_addr = (uint32_t)peer.sin_addr.s_addr;
+    if (g_cfg.max_conns_per_ip > 0 &&
+        client_count_addr(peer_addr) >= g_cfg.max_conns_per_ip){
+        char ipbuf[INET_ADDRSTRLEN] = "?";
+        inet_ntop(AF_INET, &peer.sin_addr, ipbuf, sizeof ipbuf);
+        atomic_fetch_add(&rejected_conns, 1);
+        slog("warn", "connection from %s refused: already at the per-IP limit of %d",
+             ipbuf, g_cfg.max_conns_per_ip);
+        close(cfd);
+        return;
+    }
 
     // We use a blocking socket with 5 second timeouts here. The reasoning is in
     // the note at the top of this file.
@@ -559,7 +599,7 @@ static void handle_new_client(int listen_fd){
         return;
     }
 
-    client_t *c = client_add(cfd, sess);
+    client_t *c = client_add(cfd, sess, peer_addr);
     if (c == NULL){                    // fd beyond registry bound
         slog("warn", "fd %d beyond client table, refusing", cfd);
         tetrissh_session_free(sess);
@@ -896,10 +936,12 @@ static void handle_ctl(int ctl_fd, int *running){
         status = HTTTP_200_OK;
         jb_append(&j, "{\"uptime_seconds\": %ld, \"rooms\": %d, "
                       "\"players\": %d, \"dropped_logs\": %lu, "
-                      "\"garbage_sent\": %lu, \"garbage_dropped\": %lu}",
+                      "\"garbage_sent\": %lu, \"garbage_dropped\": %lu, "
+                      "\"rejected_conns\": %lu}",
                   uptime_seconds(), rooms_count(), client_count(),
                   total_dropped(),
-                  atomic_load(&garbage_sent), atomic_load(&garbage_dropped));
+                  atomic_load(&garbage_sent), atomic_load(&garbage_dropped),
+                  atomic_load(&rejected_conns));
     } else if (strcmp(msg.path, "/rooms") == 0){
         status = HTTTP_200_OK;
         jb_append(&j, "[");
@@ -1048,6 +1090,7 @@ int main(int argc, char **argv){
     atomic_init(&shipper_stop, 0);
     atomic_init(&garbage_sent, 0);
     atomic_init(&garbage_dropped, 0);
+    atomic_init(&rejected_conns, 0);
     pthread_t shipper;
     if (pthread_create(&shipper, NULL, logshipper, NULL) != 0){
         perror("pthread_create");

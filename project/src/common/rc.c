@@ -48,6 +48,7 @@ int rc_load(const char *path, Config *out){
     out->tcp_keepalive = 120;
     out->daemonize = false; // bool field
     out->max_clients = 64;
+    out->max_conns_per_ip = 8; // per-IP cap at accept(); 0 turns the check off
     out->ctl_perm = 0700; //in octa literal
     strcpy(out->bind_addr, "127.0.0.1"); //strcpy copies the characters in since C doesnt let you assign to array
     out->cert_path[0] = '\0';
@@ -113,6 +114,7 @@ int rc_load(const char *path, Config *out){
         else if (strcmp(key, "tcp_keepalive")        == 0) { if (parse_int(value, 10, &out->tcp_keepalive)        != 0) goto badnum; }
         else if (strcmp(key, "client_timeout")       == 0) { if (parse_int(value, 10, &out->client_timeout)       != 0) goto badnum; }
         else if (strcmp(key, "max_clients")          == 0) { if (parse_int(value, 10, &out->max_clients)          != 0) goto badnum; }
+        else if (strcmp(key, "max_conns_per_ip")     == 0) { if (parse_int(value, 10, &out->max_conns_per_ip)     != 0) goto badnum; }
         else if (strcmp(key, "tick_hz")              == 0) { if (parse_int(value, 10, &out->tick_hz)              != 0) goto badnum; }
         else if (strcmp(key, "snapshot_interval")    == 0) { if (parse_int(value, 10, &out->snapshot_interval)    != 0) goto badnum; }
         else if (strcmp(key, "max_rooms")            == 0) { if (parse_int(value, 10, &out->max_rooms)            != 0) goto badnum; }
