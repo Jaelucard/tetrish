@@ -1,9 +1,9 @@
-// tetrisu.c — playable ncurses Tetris client (dot-grid / bracket style).
+// tetrisu.c: playable ncurses Tetris client (dot-grid / bracket style).
 //
 // The engine is tick-driven, so this runs a fixed ~60 Hz loop: each frame it
 // reads at most one key, turns it into a tb_input (or TB_INPUT_NONE if no key
 // was pressed), advances the game by one tick, and redraws. Gravity needs no
-// special handling — the ticks themselves drive it.
+// special handling. The ticks themselves drive it.
 
 #include <ncurses.h>
 #include <signal.h>
@@ -86,7 +86,8 @@ static tb_input key_to_input(int ch)
     switch (ch) {
     case KEY_LEFT:  return TB_INPUT_LEFT;
     case KEY_RIGHT: return TB_INPUT_RIGHT;
-    case KEY_UP:    return TB_INPUT_ROTATE;
+    case KEY_UP:    return TB_INPUT_ROTATE_CW;
+    case 'z':      return TB_INPUT_ROTATE_CCW;
     case KEY_DOWN:  return TB_INPUT_SOFT_DROP;
     case ' ':       return TB_INPUT_HARD_DROP;
     default:        return TB_INPUT_NONE;
