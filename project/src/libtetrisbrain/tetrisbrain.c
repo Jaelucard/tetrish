@@ -165,6 +165,59 @@ static void score_lines(tb_game *g, int rows)
     }
 }
 
+void tb_inject_garbage(tb_game *g, int rows, uint16_t hole_pattern)
+{
+    if (g->game_over || rows <= 0) return;
+    if (rows > TB_ROWS) rows = TB_ROWS;
+
+    // A row with no hole clears itself the instant it lands, and a row with
+    // every column holed is not garbage at all, so both degenerate patterns
+    // fall back to a single hole in column 0.
+    uint16_t all = (uint16_t)((1u << TB_COLS) - 1u);
+    if ((hole_pattern & all) == 0 || (hole_pattern & all) == all)
+        hole_pattern = 1u;
+
+    // Shift the locked stack up by `rows`. Play rows are 1..TB_ROWS with row 1
+    // at the top, so "up" means copying each row to a LOWER index. We walk
+    // top-down and read from y + rows, which is always a row we have not
+    // written yet. Anything that would land above row 1 is pushed off the
+    // playfield and lost. That is what makes garbage dangerous.
+    for (int y = 1; y <= TB_ROWS - rows; y++)
+        memcpy(&g->cells[y][1], &g->cells[y + rows][1],
+               TB_COLS * sizeof(int8_t));
+
+    // Write the garbage into the bottom `rows` rows.
+    for (int y = TB_ROWS - rows + 1; y <= TB_ROWS; y++)
+        for (int x = 1; x <= TB_COLS; x++)
+            g->cells[y][x] = (hole_pattern & (1u << (x - 1)))
+                           ? TB_CELL_EMPTY
+                           : TB_CELL_GARBAGE;
+
+    // The active piece is not stored in cells[] until it locks, so the shift
+    // cannot have overwritten it. The stack may have risen into it though, so
+    // lift it until it fits again. If there is nowhere left, the player is
+    // buried and the game ends.
+    //
+    // The lift goes one row at a time and stops at row 0, rather than jumping
+    // straight to (origin.y minus rows). That is not caution for its own sake.
+    // tb_block_fits does no bounds checking, relying instead on the one-cell
+    // sentinel border to catch out-of-play coordinates. An origin more than one
+    // row above the playfield indexes cells[] before the start of the array,
+    // which is undefined behaviour that happens to read zeros. The piece then
+    // appears to fit, and a buried player never dies.
+    if (!tb_block_fits(g, &g->active)) {
+        bool placed = false;
+        for (int lift = 1; lift <= rows && !placed; lift++) {
+            int ny = g->active.origin.y - lift;
+            if (ny < 0) break;                  // top of the playfield reached
+            tb_block cand = g->active;
+            cand.origin.y = (int8_t)ny;
+            if (tb_block_fits(g, &cand)) { g->active = cand; placed = true; }
+        }
+        if (!placed) g->game_over = true;
+    }
+}
+
 void tb_spawn(tb_game *g, tb_piece_type type)
 {
     g->active.type        = type;

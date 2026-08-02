@@ -36,6 +36,9 @@
  
 #define TB_CELL_EMPTY 0
 #define TB_CELL_WALL  0x7F
+#define TB_CELL_GARBAGE 0x7E   // Battle Royale garbage. Distinct from both the
+                               // 1..7 locked-piece values and from TB_CELL_WALL,
+                               // so a renderer can draw it differently.
 // A locked cell stores (piece_type + 1), i.e. 1..7.
 
 #define TB_NUM_PIECES       7
@@ -94,13 +97,30 @@ typedef struct {
 
 extern const tb_position tb_positions[TB_NUM_PIECES][TB_NUM_ORIENTATIONS];
 
-/* Initialize a game in-place with the given seed and spawn the first piece.
- * If seed is 0, a default nonzero seed is used. */
+// Initialize a game in-place with the given seed and spawn the first piece.
+// If seed is 0, a default nonzero seed is used.
 void tb_init(tb_game *g, uint32_t seed);
 bool tb_tick(tb_game *g, tb_input input);
 void tb_spawn(tb_game *g, tb_piece_type type);
 bool tb_block_fits(const tb_game *g, const tb_block *b);
 void tb_render(const tb_game *g, int8_t out[TB_ROWS][TB_COLS]);
 
+//Battle Royale garbage. This pushes the locked stack up by `rows` and inserts
+// that many garbage rows at the bottom.
 
-#endif 
+// hole_pattern is a bitmask over the 10 playfield columns: bit x set means
+// column x is left empty in every inserted row. A row with no hole would be
+// instantly full and clear itself, and a row with every column holed would be
+// empty, so a pattern that is 0 or has all ten bits set is replaced by a single
+// hole in column 0. The same pattern is used for every row in one injection,
+// which is the usual "clean garbage" behaviour.
+
+// Anything shifted above the top of the playfield is lost, and if the active
+// piece no longer fits after the shift the game is over.
+
+// This stays inside the design contract at the top of this file: no time, no
+// randomness, no I/O. The caller supplies the hole pattern, so two engines fed
+// the same injections stay bit-identical which is what makes replay work.
+void tb_inject_garbage(tb_game *g, int rows, uint16_t hole_pattern);
+
+#endif
