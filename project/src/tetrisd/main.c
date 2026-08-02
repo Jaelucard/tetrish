@@ -64,14 +64,16 @@
 #include "htttp.h"           // NET teammate: HTTTP parse/serialise
 #include "clients.h"
 #include "rooms.h"
+#include "garbage.h"         // the Battle Royale garbage event format
 
-#define GARBAGE_MSG_MAX 128  // must match the mq_msgsize attribute below
+// The garbage event format lives in garbage.h so that test tools can build a
+// well-formed message without duplicating the struct.
 
 // A few daemon-wide singletons. A daemon has exactly one config, one epoll
-// set and one log ring; passing them through every handler adds plumbing,
-// not clarity.
+// set and one log ring
 static Config g_cfg;
 static int    g_ep = -1;
+
 // When the daemon started, used only to answer "uptime" on the control plane.
 // Redis uses time(NULL) which is the wall clock. if NTP steps the clock backwards, then redis would report negative uptime
 // Instead I will use CLOCK_MONOTONIC which would count from an arbitary boot-relative origin and cannot go backwards
@@ -79,6 +81,31 @@ static int    g_ep = -1;
 // TLDR: I am diverging from redis here because monotonic clocks cannot be stepped (cannot make sudden jumps forward or backward)
 // compared to redis which uses wall clock time which can be stepped by NTP or other system adjustments
 static struct timespec g_started;
+
+// --- Battle Royale garbage channel -----------------------------------------
+// The queue descriptor is a singleton like the others, because the tick handler
+// has to reach it to send and main() has to reach it to receive.
+static mqd_t g_mq = (mqd_t)-1;
+
+// Accounting for the garbage channel. Same discipline as the log ring's two drop
+// counters: the increment lives on the same line as the event, so you cannot
+// send or drop without counting it.
+//   sent      the event was handed to the queue successfully
+//   dropped   the queue was full and we threw the event away. See handle_garbage.
+static atomic_ulong garbage_sent;
+static atomic_ulong garbage_dropped;
+
+// A tiny xorshift32, used only to pick a target room and a hole column. This is
+// deliberately NOT libtetrisbrain's PRNG. The engine's randomness is part of
+// replayable game state and must not be perturbed by network events. This one
+// only affects targeting, which the log records after the fact.
+static uint32_t g_rng = 2463534242u;
+static uint32_t rng_next(void){
+    g_rng ^= g_rng << 13;
+    g_rng ^= g_rng >> 17;
+    g_rng ^= g_rng << 5;
+    return g_rng;
+}
 
 // --- logging: ring buffer + logshipper thread ------------------------------
 static int log_fd = -1;
@@ -604,6 +631,7 @@ static void handle_room_tick(room_t *r){
     size_t blen = 0;
     client_t *recipients[ROOM_MAX_PLAYERS];
     int nrec = 0;
+    int garbage_rows = 0;      // total rows this room earned this tick
 
     // We advance the games and draw the boards while holding the room's lock,
     // and we build and send the network frame after we release it. This is the
@@ -613,6 +641,12 @@ static void handle_room_tick(room_t *r){
     r->ticks += expirations;
     for (int i = 0; i < ROOM_MAX_PLAYERS; i++){
         if (r->players[i] == NULL) continue;
+
+        // tb_tick only returns a bool, so it cannot tell us how many lines were
+        // cleared. lines_total is cumulative though, so the difference across
+        // the tick is the answer, and no engine change is needed to detect it.
+        uint32_t lines_before = r->games[i].lines_total;
+
         for (uint64_t e = 0; e < expirations; e++){
             // The player's queued input is applied on the first tick only. Any
             // extra catch-up ticks just apply gravity with no input.
@@ -620,6 +654,10 @@ static void handle_room_tick(room_t *r){
             if (!r->games[i].game_over)
                 tb_tick(&r->games[i], in);
         }
+
+        int cleared = (int)(r->games[i].lines_total - lines_before);
+        garbage_rows += garbage_rows_for(cleared);   // see the table in garbage.h
+
         r->pending[i] = TB_INPUT_NONE;
         blen += render_board(body + blen, sizeof body - blen,
                              r->players[i]->player_id, &r->games[i]);
@@ -629,6 +667,41 @@ static void handle_room_tick(room_t *r){
     char path[ROOM_ID_MAX + 8];
     snprintf(path, sizeof path, "/room/%s", r->id);
     pthread_mutex_unlock(&r->mu);
+
+    // Send any garbage this room earned. This happens AFTER the unlock, for the
+    // same reason the STATE frame does: mq_send is a system call, and the rule
+    // in rooms.h is that a room lock is never held across one. It also means we
+    // never hold this room's lock while touching the room table to pick a
+    // target. That is what keeps two-lock deadlock structurally impossible.
+    if (garbage_rows > 0){
+        room_t *dst = room_pick_garbage_target(r, rng_next());
+        if (dst != NULL){
+            garbage_msg_t gm;
+            memset(&gm, 0, sizeof gm);     // no uninitialised padding on the wire
+            gm.magic        = GARBAGE_MAGIC;
+            gm.rows         = (uint8_t)garbage_rows;
+            gm.hole_pattern = (uint16_t)(1u << (rng_next() % TB_COLS));
+            snprintf(gm.src_room, sizeof gm.src_room, "%s", r->id);
+            snprintf(gm.dst_room, sizeof gm.dst_room, "%s", dst->id);
+
+            // The queue is O_NONBLOCK, so a full queue returns immediately with
+            // EAGAIN instead of parking the event loop. We then throw the event
+            // away and keep ticking. This is the same policy ioq3 uses for an
+            // overflowing snapshot buffer (sv_snapshot.c:628): notice it, log
+            // it, discard it, carry on. A game server must never block on a
+            // full buffer. A dropped garbage row costs one player a slightly
+            // easier board, whereas a stalled tick freezes everybody.
+            if (mq_send(g_mq, (const char *)&gm, sizeof gm, 0) < 0){
+                atomic_fetch_add(&garbage_dropped, 1);
+                slog("warn", "garbage DROPPED (queue full): %s -> %s rows=%d: %s",
+                     gm.src_room, gm.dst_room, garbage_rows, strerror(errno));
+            } else {
+                atomic_fetch_add(&garbage_sent, 1);
+                slog("info", "garbage sent: %s -> %s rows=%d hole=0x%03x",
+                     gm.src_room, gm.dst_room, garbage_rows, gm.hole_pattern);
+            }
+        }
+    }
 
     if (nrec == 0) return;
 
@@ -700,10 +773,59 @@ static void handle_signal_event(int sig_fd, const char *rc_path, int *running){
 }
 
 static void handle_garbage(mqd_t mq){
-    char gbuf[GARBAGE_MSG_MAX];
-    ssize_t n = mq_receive(mq, gbuf, sizeof gbuf, NULL);
-    if (n < 0) return;
-    slog("info", "tetrisd: got garbage event (%zd bytes)", n);
+    // The queue is level-triggered in the epoll set and non-blocking, so we
+    // drain it in a loop rather than taking one message per wakeup. Several
+    // rooms can finish a tick before the loop comes back round to us, and a
+    // single-message handler would fall steadily behind under load.
+    for (;;){
+        char gbuf[GARBAGE_MSG_MAX];
+        ssize_t n = mq_receive(mq, gbuf, sizeof gbuf, NULL);
+        if (n < 0) return;                       // EAGAIN: queue drained
+
+        if ((size_t)n != sizeof(garbage_msg_t)){
+            slog("warn", "garbage: bad message size %zd, expected %zu", n,
+                 sizeof(garbage_msg_t));
+            continue;
+        }
+        garbage_msg_t gm;
+        memcpy(&gm, gbuf, sizeof gm);            // memcpy, not a cast: gbuf is a
+                                                 // char array with no guaranteed
+                                                 // alignment for the struct
+        if (gm.magic != GARBAGE_MAGIC){
+            // A POSIX message queue outlives the process that made it, so a
+            // stale message from an older build can still be sitting there at
+            // startup. The magic number catches that instead of injecting junk.
+            slog("warn", "garbage: bad magic 0x%08x, ignoring stale message",
+                 gm.magic);
+            continue;
+        }
+
+        // The target may have been destroyed between the send and now, because
+        // its last player can leave inside the same epoll batch. That is not an
+        // error, it just means the attack missed.
+        room_t *dst = room_find(gm.dst_room);
+        if (dst == NULL || !dst->started){
+            slog("info", "garbage: target room %s is gone, event discarded",
+                 gm.dst_room);
+            continue;
+        }
+
+        // Injection touches the per-seat games[] array, so it takes the target
+        // room's lock. We hold exactly one room lock here and call nothing that
+        // blocks while holding it, which is what rooms.h promises.
+        int hit = 0;
+        pthread_mutex_lock(&dst->mu);
+        for (int i = 0; i < ROOM_MAX_PLAYERS; i++){
+            if (dst->players[i] == NULL) continue;
+            if (dst->games[i].game_over) continue;   // already out, leave them
+            tb_inject_garbage(&dst->games[i], gm.rows, gm.hole_pattern);
+            hit++;
+        }
+        pthread_mutex_unlock(&dst->mu);
+
+        slog("info", "garbage applied: %s -> %s rows=%u players=%d",
+             gm.src_room, gm.dst_room, (unsigned)gm.rows, hit);
+    }
 }
 
 // --- control plane: plaintext HTTTP over the UDS --------------------------------
@@ -773,9 +895,11 @@ static void handle_ctl(int ctl_fd, int *running){
     } else if (strcmp(msg.path, "/status") == 0){
         status = HTTTP_200_OK;
         jb_append(&j, "{\"uptime_seconds\": %ld, \"rooms\": %d, "
-                      "\"players\": %d, \"dropped_logs\": %lu}",
+                      "\"players\": %d, \"dropped_logs\": %lu, "
+                      "\"garbage_sent\": %lu, \"garbage_dropped\": %lu}",
                   uptime_seconds(), rooms_count(), client_count(),
-                  total_dropped());
+                  total_dropped(),
+                  atomic_load(&garbage_sent), atomic_load(&garbage_dropped));
     } else if (strcmp(msg.path, "/rooms") == 0){
         status = HTTTP_200_OK;
         jb_append(&j, "[");
@@ -815,8 +939,8 @@ static void handle_ctl(int ctl_fd, int *running){
         // has already gone away returns -1 with errno == EPIPE instead of
         // killing the daemon. That is the whole point of ignoring the signal:
         // the error becomes an ordinary return value we can inspect. A short
-        // write is reported separately - not an error, but it does mean the
-        // admin saw a truncated reply, so it should not pass silently.
+        // write is reported separately. It is not an error, but it does mean
+        // the admin saw a truncated reply, so it should not pass silently.
         // msg is only filled in when the request actually parsed, so on a
         // parse failure we must not read msg.path.
         const char *what = (err == HTTTP_OK) ? msg.path : "(unparsed request)";
@@ -869,16 +993,36 @@ int main(int argc, char **argv){
     int ctl_fd = ctl_listen(&g_cfg);
     if (ctl_fd < 0){ close(listen_fd); return 1; }
 
-    // 5. Open the POSIX message queue for the Battle Royale garbage feature.
-    //    For now the handler is only a stub that logs the event. The real
-    //    behaviour is added in Week 9.
+    // 5. Open the POSIX message queue that carries Battle Royale garbage.
+    //
+    //    O_RDWR, not O_RDONLY: tetrisd is both ends of this channel. A room
+    //    that clears two or more lines sends an event, and the same process
+    //    reads it back out of the epoll set and applies it to another room.
+    //    With O_RDONLY the descriptor is valid but write-only operations fail
+    //    with EBADF, so mq_send would silently never work.
+    //
+    //    O_NONBLOCK is what makes the drop policy possible: mq_send on a full
+    //    queue returns EAGAIN immediately instead of parking the event loop,
+    //    and mq_receive on an empty one lets the drain loop terminate.
+    //
+    //    mq_maxmsg 10 bounds the queue. That bound is deliberate and is the
+    //    opposite of the choice Redis makes for its background job list
+    //    (bio.c:72), which is unbounded because dropping an fsync would lose
+    //    data. Dropping a garbage row only makes one player's board slightly
+    //    easier, so here a bounded queue with an explicit drop is correct.
     struct mq_attr attr = { .mq_flags = 0, .mq_maxmsg = 10,
                             .mq_msgsize = GARBAGE_MSG_MAX, .mq_curmsgs = 0 };
-    mqd_t mq = mq_open(g_cfg.garbage_mq, O_CREAT | O_RDONLY | O_NONBLOCK, 0600, &attr);
+    mqd_t mq = mq_open(g_cfg.garbage_mq, O_CREAT | O_RDWR | O_NONBLOCK, 0600, &attr);
     if (mq == (mqd_t)-1){
         perror("mq_open");
         close(listen_fd); close(ctl_fd); return 1;
     }
+    g_mq = mq;                 // the tick handler sends through this
+
+    // Seed the targeting PRNG. getpid keeps two daemons on one machine from
+    // picking identical target sequences. This randomness never touches game
+    // state, because libtetrisbrain has its own seeded PRNG for that.
+    g_rng ^= (uint32_t)getpid() * 2654435761u;
 
     // 6. Set up the socket we use to send logs to tetrislogd. After this point
     //    only the logshipper thread ever uses it.
@@ -902,6 +1046,8 @@ int main(int argc, char **argv){
     ring_init(&g_ring);
     atomic_init(&dropped_send, 0);
     atomic_init(&shipper_stop, 0);
+    atomic_init(&garbage_sent, 0);
+    atomic_init(&garbage_dropped, 0);
     pthread_t shipper;
     if (pthread_create(&shipper, NULL, logshipper, NULL) != 0){
         perror("pthread_create");
@@ -984,10 +1130,10 @@ int main(int argc, char **argv){
 
     // Phases 3 and 4: flush, then exit. Both records are pushed BEFORE the
     // shipper is stopped, because the shipper is the only thing that can
-    // deliver them - once it is joined, nothing can be logged any more. So
-    // record 4 describes what is about to happen rather than what already
-    // has. That is unavoidable: the log channel is itself part of what
-    // shutdown tears down.
+    // deliver them. Once it is joined, nothing can be logged any more, so
+    // record 4 describes what is about to happen rather than what already has.
+    // That is unavoidable: the log channel is itself part of what shutdown
+    // tears down.
     slog("info", "tetrisd: phase 3: flushing log ring");
     slog("info", "tetrisd: phase 4: closing descriptors and exiting");
 

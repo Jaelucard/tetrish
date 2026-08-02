@@ -1,9 +1,9 @@
-// Room data structure (Week 6, day 4-5).
-//
+// Room data structure.
+
 // A room owns its id, up to ROOM_MAX_PLAYERS seated clients, one
 // authoritative libtetrisbrain game per seat, one pending input per seat,
 // and, once START has been received, a timerfd that drives the tick.
-//
+
 // Why each room has a mutex, and when it is held.
 // Right now, every room access happens on the single epoll dispatch thread.
 // That includes JOIN, LEAVE, and START coming from the client handlers, game
@@ -25,7 +25,7 @@
 // sends the data after unlocking. This is the same discipline used by the
 // log ring: copy the data while holding the lock, then do the actual
 // input/output work outside the lock.
-//
+
 // Lock order note for the README. The system now has the ring buffer's
 // mutex, plus one mutex per room. No code path ever holds both of these at
 // the same time, because ring_push is only ever called from outside a room
@@ -44,11 +44,11 @@
 
 #define ROOM_ID_MAX      32
 #define ROOM_MAX_PLAYERS 8     // This is the compile-time seat limit. The
-                               // actual runtime cap is cfg->max_players_per_room,
+                               // actual runtime cap is cfg->max_players_per_room
                                // and it is checked to make sure it never
                                // exceeds this value.
 #define ROOM_HARD_MAX    32    // This is the compile-time room limit. The
-                               // actual runtime cap is cfg->max_rooms, and
+                               // actual runtime cap is cfg->max_rooms and
                                // it is checked to make sure it never
                                // exceeds this value.
 
@@ -78,7 +78,7 @@ room_t *room_by_timerfd(int tfd);        // Looks up a room by its timerfd. This
 // or creates a new one if it does not, and then seats the client in an open
 // slot. It writes the HTTTP status code to return into *status: 201 if the
 // room was just created, 200 if the client joined an existing room, 409 if
-// the room is full or the game has already started, and 500 if the whole
+// the room is full or the game has already started and 500 if the whole
 // room table is full. On success it returns the room, with *status set to
 // 200 or 201. On failure it returns NULL, with *status explaining why.
 room_t *room_join(const char *id, client_t *c, int *status);
@@ -93,5 +93,13 @@ int room_leave(client_t *c);
 
 int rooms_count(void);
 void rooms_foreach(void (*fn)(room_t *r, void *arg), void *arg);
+
+// Battle Royale targeting. Picks a room to send garbage to: any active, started
+// room other than `exclude`. `r` is a random value supplied by the caller, so
+// this function stays free of hidden state and is easy to test. Returns NULL
+// when there is no other started room, which is the normal case for a solo
+// game. The base rule is "a random other room"; retargeting by score is one of
+// the live-extension tasks and is deliberately not implemented here.
+room_t *room_pick_garbage_target(const room_t *exclude, uint32_t r);
 
 #endif
