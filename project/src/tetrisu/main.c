@@ -61,18 +61,15 @@
 #include <signal.h>
 #include <ncurses.h>
 #include <sys/select.h>
-#include <sys/socket.h>
 #include <sys/signalfd.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
 #include "rc.h"
-#include "tetrissh.h"
 #include "htttp.h"
+#include "local.h"
+#include "net.h"
 
-#define VIEW_ROWS      20        // must match the server's board, checked on arrival
-#define VIEW_COLS      10
-#define MAX_BOARDS      8        // one per seat in a room
+#define VIEW_ROWS   NET_VIEW_ROWS
+#define VIEW_COLS   NET_VIEW_COLS
+#define MAX_BOARDS  NET_MAX_BOARDS
 #define CELL_W          2        // two terminal columns per cell, so cells look square
 #define BOARD_LEFT      2
 #define FRAME_US    16000        // ~60 Hz display against a 20 Hz server
@@ -84,24 +81,8 @@
 // terminal is actually tall enough, rather than being demanded up front.
 #define ROWS_REQUIRED  (VIEW_ROWS + 4)
 
-// One player's board as most recently broadcast. Everything here comes off the
-// wire, so nothing in it is trusted until it has been range checked.
-typedef struct {
-    char     id[32];
-    unsigned score, level, lines;
-    int      over;
-    char     cells[VIEW_ROWS][VIEW_COLS];
-    int      rows_filled;        // how many rows this block actually supplied
-} board_t;
-
-static tetrissh_session_t *g_sess;
-static int      g_sock = -1;
-static board_t  g_boards[MAX_BOARDS];
-static int      g_nboards = 0;
-static char     g_player_id[32] = "";
+static net_ctx  g_net;
 static int      g_curses_up = 0;
-static long     g_states = 0, g_acks = 0;
-static int      g_last_status = 0;
 
 // Registered with atexit BEFORE curses starts, so every exit path restores the
 // terminal, including ones that have not been written yet. jserv's tetris does
@@ -121,126 +102,9 @@ static void die(const char *fmt, const char *arg){
     exit(1);
 }
 
-// --- protocol ---------------------------------------------------------------
-
-static int send_request(htttp_method_t m, const char *path, const char *body){
-    htttp_builder_t b;
-    htttp_builder_init_request(&b, m, path);
-    if (g_player_id[0]) htttp_builder_add_header(&b, "Player-Id", g_player_id);
-    if (body){
-        htttp_builder_add_header(&b, "Content-Type", "application/tetris-command");
-        htttp_builder_set_body(&b, (const unsigned char *)body, strlen(body));
-    }
-    size_t wlen = 0;
-    char *wire = htttp_serialise(&b, &wlen);
-    if (wire == NULL) return -1;
-    int rc = tetrissh_send(g_sess, g_sock, (unsigned char *)wire, wlen);
-    free(wire);
-    return rc;
-}
-
-// Used only during the opening handshake, before the frame loop starts. Once
-// the loop is running nothing ever waits for a reply: the authoritative board
-// arrives in the next STATE broadcast regardless, so requests are sent and
-// forgotten and their acknowledgements are read and discarded.
-static int read_until_response(htttp_msg_t *msg, char *keep, size_t keep_sz){
-    for (;;){
-        size_t plen = 0;
-        unsigned char *plain = tetrissh_recv(g_sess, g_sock, &plen);
-        if (plain == NULL) return -1;
-        if (plen >= 6 && memcmp(plain, "HTTTP/", 6) == 0){
-            if (plen >= keep_sz) plen = keep_sz - 1;
-            memcpy(keep, plain, plen);
-            free(plain);
-            if (htttp_parse_response(keep, plen, msg) != HTTTP_OK) return -1;
-            return (int)msg->status;
-        }
-        free(plain);                 // a STATE broadcast arriving early
-    }
-}
-
-// Parse a STATE body into the board table.
-//
-// The body is one block per player:
-//
-//   player p7 score 0 level 1 lines 0 over 0
-//   ..........          <- VIEW_ROWS rows of VIEW_COLS chars
-//   ..........             '.' is empty, a digit is a filled cell
-//
-// Everything here arrives from the network, so every index is bounded before
-// it is used and a malformed block is dropped rather than trusted. The rule
-// being followed is that no buffer size, loop bound or offset is ever taken
-// from a value the peer supplied.
-static void parse_state(const char *body, size_t len){
-    int n = 0;
-    board_t tmp[MAX_BOARDS];
-    memset(tmp, 0, sizeof tmp);
-
-    const char *p = body, *end = body + len;
-    while (p < end && n < MAX_BOARDS){
-        const char *nl = memchr(p, '\n', (size_t)(end - p));
-        size_t linelen = nl ? (size_t)(nl - p) : (size_t)(end - p);
-
-        if (linelen > 7 && memcmp(p, "player ", 7) == 0){
-            char line[256];
-            size_t cp = linelen < sizeof line - 1 ? linelen : sizeof line - 1;
-            memcpy(line, p, cp);
-            line[cp] = '\0';
-            n++;
-            board_t *b = &tmp[n - 1];
-            // A short read here just leaves the tail zeroed; the block is still
-            // usable for drawing, which matters more than rejecting it.
-            sscanf(line, "player %31s score %u level %u lines %u over %d",
-                   b->id, &b->score, &b->level, &b->lines, &b->over);
-        } else if (n > 0 && linelen > 0){
-            board_t *b = &tmp[n - 1];
-            if (b->rows_filled < VIEW_ROWS){
-                size_t cols = linelen < VIEW_COLS ? linelen : VIEW_COLS;
-                for (size_t x = 0; x < cols; x++)
-                    b->cells[b->rows_filled][x] = p[x];
-                b->rows_filled++;
-            }
-            // Extra rows beyond VIEW_ROWS are discarded rather than written
-            // past the end of the array. A server that sent a taller board
-            // would be a bug, not a licence to overflow.
-        }
-        if (nl == NULL) break;
-        p = nl + 1;
-    }
-
-    if (n > 0){ memcpy(g_boards, tmp, sizeof tmp); g_nboards = n; g_states++; }
-}
-
-// Read exactly one frame and classify it. A frame beginning "HTTTP/" is a
-// response to something we sent; anything else is a server-originated STATE
-// request. That single comparison is the whole disambiguation rule, and it is
-// why the client can interleave its own requests with unsolicited broadcasts
-// on one connection.
-static int read_one_frame(void){
-    size_t plen = 0;
-    unsigned char *plain = tetrissh_recv(g_sess, g_sock, &plen);
-    if (plain == NULL) return -1;              // closed, timed out, or bad frame
-
-    if (plen >= 6 && memcmp(plain, "HTTTP/", 6) == 0){
-        char keep[2048];
-        size_t cp = plen < sizeof keep - 1 ? plen : sizeof keep - 1;
-        memcpy(keep, plain, cp);
-        htttp_msg_t msg;
-        if (htttp_parse_response(keep, cp, &msg) == HTTTP_OK)
-            g_last_status = (int)msg.status;
-        g_acks++;
-    } else {
-        htttp_msg_t st;
-        if (htttp_parse_request((const char *)plain, plen, &st) == HTTTP_OK &&
-            st.method == HTTTP_METHOD_STATE && st.body != NULL)
-            parse_state((const char *)st.body, st.body_len);
-    }
-    free(plain);
-    return 0;
-}
-
 // --- rendering --------------------------------------------------------------
 
+// draws one board's box-drawing border at the given screen position.
 static void draw_frame_at(int top, int left){
     int w = VIEW_COLS * CELL_W;
     mvaddch(top, left, ACS_ULCORNER);
@@ -257,6 +121,10 @@ static void draw_frame_at(int top, int left){
     }
 }
 
+// draws one player's board exactly as the server broadcast it: border,
+// cells (coloured by the digit the server sent), name row, score line, and
+// a GAME OVER banner when their flag is set. is_me marks our own board
+// with a '>' so it stands out among opponents.
 static void draw_board(const board_t *b, int top, int left, int is_me){
     draw_frame_at(top, left);
     for (int y = 0; y < VIEW_ROWS; y++)
@@ -294,7 +162,11 @@ static void draw_board(const board_t *b, int top, int left, int is_me){
     }
 }
 
-static void draw_all(const char *room, int connected){
+// redraws the whole frame: title row, every board the last STATE frame
+// carried (side by side, as many as fit the terminal), and the key help
+// footer. everything drawn here comes from net_ctx -- this client holds no
+// game state of its own.
+static void draw_all(const net_ctx *net, const char *room, int connected){
     erase();
 
     // Lay out from the bottom of the mandatory block upwards, so the board
@@ -303,15 +175,15 @@ static void draw_all(const char *room, int connected){
     int board_top  = have_names ? 2 : 1;      // the top border row
 
     mvprintw(0, BOARD_LEFT, "tetriSH %s as %s  states %ld  acks %ld%s",
-             room, g_player_id, g_states, g_acks,
+             room, net->player_id, net->states, net->acks,
              connected ? "" : "  [DISCONNECTED]");
 
     int per = VIEW_COLS * CELL_W + 4;
-    for (int i = 0; i < g_nboards; i++){
+    for (int i = 0; i < net->nboards; i++){
         int left = BOARD_LEFT + i * per;
         if (left + per > COLS) break;         // never draw off the screen edge
-        draw_board(&g_boards[i], board_top, left,
-                   strcmp(g_boards[i].id, g_player_id) == 0);
+        draw_board(&net->boards[i], board_top, left,
+                   strcmp(net->boards[i].id, net->player_id) == 0);
     }
 
     int f = board_top + VIEW_ROWS + 3;
@@ -327,14 +199,46 @@ static void draw_all(const char *room, int connected){
 
 // --- main -------------------------------------------------------------------
 
+// the networked client's whole life: parse arguments (dispatching --local
+// and --spectate first), take SIGINT/SIGTERM as a signalfd, connect and
+// handshake, JOIN the room and learn our Player-Id, START (409 = someone
+// already did = fine), then bring up curses and run the select() loop --
+// keyboard to requests, socket frames to the screen -- until quit or
+// disconnect, tearing down curses cleanly at the end.
 int main(int argc, char **argv){
     if (argc < 2){
         fprintf(stderr,
                 "usage: %s <rc-file> [room]\n"
-                "  connects to tetrisd, joins a room, and plays it in the terminal\n",
-                argv[0]);
+                "       %s --local [seed] [start-level]\n"
+                "       %s --spectate <rc-file> [room]\n"
+                "  connects to tetrisd, joins a room, and plays it in the terminal;\n"
+                "  --local instead plays a full game against an in-process brain, no\n"
+                "  server required; --spectate is not yet supported by the server\n"
+                "  (see REQUIRED_FILES.md)\n",
+                argv[0], argv[0], argv[0]);
         return 2;
     }
+
+    // --local never touches the network: it runs the same brain tetrisd runs,
+    // in-process, for offline play and testing. Kept behind a flag so the
+    // normal path stays server-authoritative, per the week-7 requirement.
+    if (strcmp(argv[1], "--local") == 0){
+        uint32_t seed  = (argc > 2) ? (uint32_t)strtoul(argv[2], NULL, 10) : 0;
+        uint32_t level = (argc > 3) ? (uint32_t)strtoul(argv[3], NULL, 10) : 0;
+        return tetrisu_local_run(seed, level);
+    }
+
+    // todo: requires tetrisd spectate join mode (REQUIRED_FILES.md). JOIN
+    // always deals the caller a board today; there is no way to watch a room
+    // without occupying a seat in it. Parsed and reported to the boundary
+    // rather than silently falling through to a normal (participating) JOIN.
+    if (strcmp(argv[1], "--spectate") == 0){
+        fprintf(stderr,
+                "tetrisu: --spectate requires server spectate support, "
+                "which tetrisd does not yet have (see REQUIRED_FILES.md)\n");
+        return 2;
+    }
+
     const char *rc_path = argv[1];
     const char *room    = (argc > 2) ? argv[2] : "demo";
 
@@ -352,43 +256,24 @@ int main(int argc, char **argv){
     int sigfd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
     if (sigfd < 0) die("signalfd: %s", strerror(errno));
 
-    g_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (g_sock < 0) die("socket: %s", strerror(errno));
-
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sin_family = AF_INET;
-    sa.sin_port   = htons((uint16_t)cfg.listen_port);
-    if (inet_pton(AF_INET, cfg.bind_addr, &sa.sin_addr) != 1)
-        die("bad server address %s", cfg.bind_addr);
-    if (connect(g_sock, (struct sockaddr *)&sa, sizeof sa) < 0)
-        die("cannot reach tetrisd: %s", strerror(errno));
-
-    // Nagle would hold a small keypress packet until the previous one was
-    // acknowledged. Combined with the peer's delayed-ACK timer that is a stall
-    // of tens of milliseconds, longer than an entire frame, and it reads to the
-    // player as input lag. Redis sets this unconditionally on every connection
-    // and does not even offer a switch to turn it off.
-    int one = 1;
-    setsockopt(g_sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-
-    // The socket stays blocking because libtetrissh needs it that way. These
-    // bound how long a half-delivered frame can hold up the display.
-    struct timeval to = { .tv_sec = 5, .tv_usec = 0 };
-    setsockopt(g_sock, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof to);
-    setsockopt(g_sock, SOL_SOCKET, SO_SNDTIMEO, &to, sizeof to);
-
-    g_sess = tetrissh_session_alloc();
-    if (g_sess == NULL) die("out of memory allocating the session", "");
-    if (tetrissh_handshake_client(g_sess, g_sock, cfg.ca_path) != 0)
-        die("handshake failed: %s", tetrissh_strerror(g_sess));
+    if (net_connect_and_handshake(&cfg, &g_net) != 0){
+        // Copy the reason out BEFORE net_close: tetrissh_strerror returns a
+        // pointer into the session object ("valid until the next call on
+        // sess", tetrissh.h), and net_close both overwrites that buffer
+        // (tetrissh_close writes "session closed" into it) and then frees it.
+        char why[256];
+        snprintf(why, sizeof why, "%s",
+                 g_net.sess ? tetrissh_strerror(g_net.sess) : strerror(errno));
+        net_close(&g_net);
+        die("could not connect/handshake: %s", why);
+    }
 
     char path[64], keep[4096];
     htttp_msg_t msg;
 
     snprintf(path, sizeof path, "/room/%s", room);
-    if (send_request(HTTTP_METHOD_JOIN, path, NULL) != 0) die("JOIN send failed", "");
-    int st = read_until_response(&msg, keep, sizeof keep);
+    if (net_send_action(&g_net, HTTTP_METHOD_JOIN, path, NULL) != 0) die("JOIN send failed", "");
+    int st = net_await_response(&g_net, &msg, keep, sizeof keep);
     if (st != 200 && st != 201){
         char what[64];
         snprintf(what, sizeof what, "status %d", st);
@@ -397,15 +282,15 @@ int main(int argc, char **argv){
 
     size_t vlen = 0;
     const char *v = htttp_find_header(&msg, "Player-Id", &vlen);
-    if (v == NULL || vlen == 0 || vlen >= sizeof g_player_id)
+    if (v == NULL || vlen == 0 || vlen >= sizeof g_net.player_id)
         die("server issued no Player-Id", "");
-    memcpy(g_player_id, v, vlen);
-    g_player_id[vlen] = '\0';
+    memcpy(g_net.player_id, v, vlen);
+    g_net.player_id[vlen] = '\0';
 
     // 409 means somebody already started this room, which is success from our
     // point of view: the ticker we needed is already running.
-    if (send_request(HTTTP_METHOD_START, path, NULL) != 0) die("START send failed", "");
-    st = read_until_response(&msg, keep, sizeof keep);
+    if (net_send_action(&g_net, HTTTP_METHOD_START, path, NULL) != 0) die("START send failed", "");
+    st = net_await_response(&g_net, &msg, keep, sizeof keep);
     if (st != 200 && st != 409) die("START refused by the server", "");
 
     // Curses comes up only now, so every failure above prints normally.
@@ -437,9 +322,9 @@ int main(int argc, char **argv){
         FD_ZERO(&rfds);
         FD_SET(STDIN_FILENO, &rfds);
         FD_SET(sigfd, &rfds);
-        if (connected) FD_SET(g_sock, &rfds);
+        if (connected) FD_SET(g_net.sock, &rfds);
 
-        int maxfd = sigfd > g_sock ? sigfd : g_sock;
+        int maxfd = sigfd > g_net.sock ? sigfd : g_net.sock;
         if (STDIN_FILENO > maxfd) maxfd = STDIN_FILENO;
 
         struct timeval tv = { .tv_sec = 0, .tv_usec = FRAME_US };
@@ -481,28 +366,25 @@ int main(int argc, char **argv){
                 if (body != NULL && connected){
                     char mpath[96];
                     snprintf(mpath, sizeof mpath, "/room/%s/player/%s",
-                             room, g_player_id);
-                    if (send_request(m, mpath, body) != 0) connected = 0;
+                             room, g_net.player_id);
+                    if (net_send_action(&g_net, m, mpath, body) != 0) connected = 0;
                 }
             }
         }
 
-        if (connected && FD_ISSET(g_sock, &rfds)){
-            if (read_one_frame() < 0) connected = 0;
+        if (connected && FD_ISSET(g_net.sock, &rfds)){
+            if (net_poll_state(&g_net) < 0) connected = 0;
         }
 
-        draw_all(room, connected);
+        draw_all(&g_net, room, connected);
     }
 
-    if (connected){
-        send_request(HTTTP_METHOD_LEAVE, path, NULL);
-        tetrissh_close(g_sess);
-    }
-    tetrissh_session_free(g_sess);
-    close(g_sock);
+    if (connected)
+        net_send_action(&g_net, HTTTP_METHOD_LEAVE, path, NULL);
+    net_close(&g_net);
     close(sigfd);
     restore_terminal();
     printf("left room %s as %s: %ld state frames, %ld acks\n",
-           room, g_player_id, g_states, g_acks);
+           room, g_net.player_id, g_net.states, g_net.acks);
     return 0;
 }

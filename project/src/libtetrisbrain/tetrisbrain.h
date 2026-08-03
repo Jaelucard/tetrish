@@ -75,8 +75,17 @@ typedef enum {
     TB_INPUT_ROTATE_CCW,   // both directions now exist, and both try SRS kicks
     TB_INPUT_ROTATE_CW,
     TB_INPUT_SOFT_DROP,
-    TB_INPUT_HARD_DROP
+    TB_INPUT_HARD_DROP,
+    TB_INPUT_HOLD          // appended: never sent by old replay logs
 } tb_input;
+
+// Why the game ended, distinct from the boolean game_over. Both causes leave
+// the board in a legitimate state; the cause is only for display/logging.
+typedef enum {
+    TB_OVER_NONE,
+    TB_OVER_BLOCKOUT,   // a freshly spawned piece had nowhere to go
+    TB_OVER_TOPOUT      // garbage rose into the active piece with no room to lift it
+} tb_over_cause;
 
 // cell offsets use an {x, y} convention: x is column, y is row.
 typedef struct { int8_t x, y; } tb_point;
@@ -111,6 +120,23 @@ typedef struct {
     uint32_t rng_state;          // xorshift32, part of the game state
     uint8_t  bag[TB_NUM_PIECES];
     uint8_t  bag_index;
+
+    // Points awarded per line clear, indexed by (rows - 1): single, double,
+    // triple, tetris. Multiplied by level. tb_init sets the classic values;
+    // exposed as game state (not a #define) so a future variant ruleset can
+    // override it without an API change.
+    uint16_t tetris_points[4];
+
+    tb_over_cause over_cause;    // TB_OVER_NONE until game_over becomes true
+
+    // Hold: stash the active piece and swap in the held one (or the next bag
+    // piece if nothing is held yet). held_this_turn blocks a second hold
+    // before the next lock, which stops a piece cycling between hold and
+    // play forever.
+    int8_t hold;                 // -1 = empty, else a tb_piece_type
+    bool   held_this_turn;
+
+    uint32_t start_level;        // level tb_set_start_level was called with
 } tb_game;
 
 extern const tb_position tb_positions[TB_NUM_PIECES][TB_NUM_ORIENTATIONS];
@@ -126,10 +152,28 @@ void tb_init(tb_game *g, uint32_t seed);
  * gravity cannot move the piece down. */
 void tb_set_lock_delay(tb_game *g, uint32_t ticks);
 
+/* Set the starting level. Recomputes gravity_period from the same formula
+ * tb_init and level-ups use, so calling this mid-game re-derives gravity for
+ * the new level rather than just overwriting the counter. Call it right after
+ * tb_init, before any ticks, for a configured starting level; calling it
+ * later is legal but will look like a sudden speed change. */
+void tb_set_start_level(tb_game *g, uint32_t level);
+
 bool tb_tick(tb_game *g, tb_input input);
 void tb_spawn(tb_game *g, tb_piece_type type);
 bool tb_block_fits(const tb_game *g, const tb_block *b);
 void tb_render(const tb_game *g, int8_t out[TB_ROWS][TB_COLS]);
+
+// The row the active piece would land on if hard-dropped right now. Pure:
+// takes no lock, leaves the game unchanged. For rendering a ghost piece.
+int tb_ghost_y(const tb_game *g);
+
+// The next piece to be drawn from the bag, without drawing it. Pure: never
+// refills the bag, so it returns -1 once the current bag window is spent
+// (rather than rolling the rng to peek past it). Callers that only peek
+// right after a spawn will never see -1, since a spawn either draws the last
+// bag slot (leaving nothing to peek) or an earlier one.
+int tb_next_piece(const tb_game *g);
 
 //Battle Royale garbage. This pushes the locked stack up by `rows` and inserts
 // that many garbage rows at the bottom.
