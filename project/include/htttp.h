@@ -34,6 +34,7 @@ typedef enum {
     HTTTP_METHOD_ADMIN_STATUS,   // GET-like: server + room + player counts.
     HTTTP_METHOD_ADMIN_ROOMS,    // GET-like: full room list, same shape as ctl's /rooms.
     HTTTP_METHOD_ADMIN_ATTACH,   // Subscribes this connection to a room's STATE stream, read-only.
+    HTTTP_METHOD_ADMIN_KICK,     // Mutating: removes a player from a room. Full admin only.
 } htttp_method_t;
 
 typedef enum {

@@ -25,6 +25,7 @@ ssize_t session_write(session_t *s, const void *buf, size_t len);
 
 void session_close(session_t *s);
 int session_is_ready(const session_t *s);
+int session_last_recv_was_oversized(const session_t *s);
 const char *session_strerror(const session_t *s);
 
 #endif

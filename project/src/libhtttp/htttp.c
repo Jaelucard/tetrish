@@ -152,6 +152,7 @@ static const struct {htttp_method_t m; const char *s;} _method_table[] = {
     {HTTTP_METHOD_ADMIN_STATUS, "ADMIN-STATUS"},
     {HTTTP_METHOD_ADMIN_ROOMS, "ADMIN-ROOMS"},
     {HTTTP_METHOD_ADMIN_ATTACH, "ADMIN-ATTACH"},
+    {HTTTP_METHOD_ADMIN_KICK, "ADMIN-KICK"},
     {HTTTP_METHOD_UNKNOWN, NULL}
 };
 

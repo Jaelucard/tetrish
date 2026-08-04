@@ -115,9 +115,9 @@ $(BINDIR)/tetrisctl: $(BUILDDIR)/tetrisctl/main.o $(COMMON_OBJ) $(LIB_HTTTP)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -o $@ $^
 
-$(BINDIR)/tetrisu: $(BUILDDIR)/tetrisu/main.o
+$(BINDIR)/tetrisu: $(BUILDDIR)/tetrisu/main.o $(COMMON_OBJ) $(LIB_SSH) $(LIB_HTTTP)
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) -o $@ $^ $(SSLLIBS)
 
 $(BINDIR)/tetrish-view: $(BUILDDIR)/tetrish-view/main.o
 	@mkdir -p $(@D)

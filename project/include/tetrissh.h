@@ -28,5 +28,6 @@ void tetrissh_close(tetrissh_session_t *sess);
 
 int tetrissh_is_ready(const tetrissh_session_t *sess);
 const char *tetrissh_strerror(const tetrissh_session_t *sess);
+int tetrissh_last_recv_was_oversized(const tetrissh_session_t *sess);
 
 #endif
