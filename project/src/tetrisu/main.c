@@ -189,7 +189,7 @@ static void draw_all(const net_ctx *net, const char *room, int connected){
     int f = board_top + VIEW_ROWS + 3;
     if (f < LINES)
         mvprintw(f, BOARD_LEFT,
-                 "arrows move - up rot cw - z ccw - space drop - q quit");
+                 "left/right move - down soft - space hard - up/x rot cw - z ccw - q quit");
 
     // One doupdate per frame rather than a refresh per element, so the screen
     // updates atomically and never tears between boards.
@@ -356,11 +356,17 @@ int main(int argc, char **argv){
                 switch (ch){
                 case KEY_LEFT:  m = HTTTP_METHOD_MOVE;   body = "LEFT";  break;
                 case KEY_RIGHT: m = HTTTP_METHOD_MOVE;   body = "RIGHT"; break;
-                case KEY_UP:    m = HTTTP_METHOD_ROTATE; body = "CW";    break;
-                case 'z':       m = HTTTP_METHOD_ROTATE; body = "CCW";   break;
+                case KEY_UP:
+                case 'x': case 'X':
+                                m = HTTTP_METHOD_ROTATE; body = "CW";    break;
+                case 'z': case 'Z':
+                                m = HTTTP_METHOD_ROTATE; body = "CCW";   break;
                 case KEY_DOWN:  m = HTTTP_METHOD_DROP;   body = "SOFT";  break;
                 case ' ':       m = HTTTP_METHOD_DROP;   body = "HARD";  break;
-                case 'q':       running = 0; break;
+                // No 180/hold/pause here: the wire protocol carries only
+                // MOVE/ROTATE/DROP, and a server-authoritative multiplayer
+                // room cannot pause for one player. Local mode has them all.
+                case 'q': case 'Q': running = 0; break;
                 default: break;                       // ERR and unknown keys
                 }
                 if (body != NULL && connected){

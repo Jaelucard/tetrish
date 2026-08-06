@@ -1,5 +1,7 @@
 #include <stddef.h>
 #include <stdlib.h>
+#include <ctype.h>      // isspace: relying on the implicit declaration is an
+                        // error on clang and gcc 14+, not just a warning
 #include <string.h>
 #include <stdio.h>
 #include <time.h>

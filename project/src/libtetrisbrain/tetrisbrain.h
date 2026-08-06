@@ -76,7 +76,9 @@ typedef enum {
     TB_INPUT_ROTATE_CW,
     TB_INPUT_SOFT_DROP,
     TB_INPUT_HARD_DROP,
-    TB_INPUT_HOLD          // appended: never sent by old replay logs
+    TB_INPUT_HOLD,         // appended: never sent by old replay logs
+    TB_INPUT_ROTATE_180    // appended for the same reason: two orientation
+                           // steps in one input, with its own small kick set
 } tb_input;
 
 // Why the game ended, distinct from the boolean game_over. Both causes leave
@@ -86,6 +88,16 @@ typedef enum {
     TB_OVER_BLOCKOUT,   // a freshly spawned piece had nowhere to go
     TB_OVER_TOPOUT      // garbage rose into the active piece with no room to lift it
 } tb_over_cause;
+
+// How the engine recognised the most recent lock. Scoring keys off this, and a
+// frontend can use it to name the clear on screen. A "mini" is a t-spin into a
+// shallow slot: it satisfies the 3-corner rule but got there on a kick without
+// filling both corners of the T's pointing face, so it pays roughly a quarter.
+typedef enum {
+    TB_CLEAR_NORMAL,
+    TB_CLEAR_TSPIN,
+    TB_CLEAR_TSPIN_MINI
+} tb_clear_kind;
 
 // cell offsets use an {x, y} convention: x is column, y is row.
 typedef struct { int8_t x, y; } tb_point;
@@ -122,7 +134,7 @@ typedef struct {
     uint8_t  bag_index;
 
     // Points awarded per line clear, indexed by (rows - 1): single, double,
-    // triple, tetris. Multiplied by level. tb_init sets the classic values;
+    // triple, quad. Multiplied by level. tb_init sets the guideline values;
     // exposed as game state (not a #define) so a future variant ruleset can
     // override it without an API change.
     uint16_t tetris_points[4];
@@ -137,6 +149,36 @@ typedef struct {
     bool   held_this_turn;
 
     uint32_t start_level;        // level tb_set_start_level was called with
+
+    /* Guideline scoring state. Everything from here down is APPENDED: tetrisd
+     * links this engine directly and snapshots tb_game by memcpy, so the
+     * fields above must keep both their order and their offsets. */
+
+    // Line-clearing pieces immediately BEFORE this one, so the first clear of
+    // a chain pays no combo and the second pays one unit. A piece that clears
+    // nothing resets it to zero.
+    uint32_t combo_count;
+    // Consecutive "difficult" clears, meaning a quad or a t-spin that cleared
+    // lines. Nonzero is what arms the back-to-back multiplier. A piece that
+    // clears nothing leaves this alone; an ordinary clear zeroes it.
+    uint32_t b2b_count;
+
+    // The t-spin test needs to know how the piece reached the square it locked
+    // on: only a rotation qualifies, and whether that rotation needed a kick is
+    // what separates a mini from a full spin. Both reset on every spawn.
+    bool last_was_rotation;
+    bool last_rotation_kicked;
+
+    tb_clear_kind last_clear_kind;   // what the most recent lock was recognised as
+
+    // Bonus values, game state rather than #defines for the same reason
+    // tetris_points is: a variant ruleset can retune them without an API change.
+    uint16_t combo_points;           // per combo step, times level
+    uint16_t perfect_clear_points;   // board left completely empty by a clear
+    uint16_t tspin_points[4];        // t-spin bonus, indexed by rows cleared 0..3
+    uint16_t tspin_mini_points[3];   // mini bonus, indexed by rows cleared 0..2
+    uint8_t  soft_drop_points;       // per cell descended, NOT times level
+    uint8_t  hard_drop_points;       // per cell descended, NOT times level
 } tb_game;
 
 extern const tb_position tb_positions[TB_NUM_PIECES][TB_NUM_ORIENTATIONS];

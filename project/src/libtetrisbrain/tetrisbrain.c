@@ -2,8 +2,29 @@
 #include <string.h>
 #include <assert.h>
 
-// classic single/double/triple/tetris point values, before the level multiplier
-static const uint16_t TETRIS_POINTS_DEFAULT[4] = {40, 100, 300, 1200};
+// guideline single/double/triple/quad point values, before the level
+// multiplier. These replaced the classic NES {40, 100, 300, 1200}: that table
+// paid a quad 30x a single, which left every bonus below it as rounding error.
+// The guideline spread of 8x is shallow enough that a t-spin double genuinely
+// competes with a quad, which is what makes the bonuses a real decision.
+static const uint16_t TETRIS_POINTS_DEFAULT[4] = {100, 300, 500, 800};
+
+// T-spin bonus on top of the base clear, indexed by rows cleared. Index 0 is
+// the spin that clears nothing and is still worth more than a plain single --
+// setting up a spin is the point of the mechanic, not the lines it happens to
+// take. A T spans at most three rows in any orientation, so index 3 is the
+// largest reachable entry.
+static const uint16_t TSPIN_POINTS_DEFAULT[4] = {400, 800, 1200, 1600};
+
+// A mini pays roughly a quarter of a full spin. The table stops at a double
+// because a mini is by definition a spin into a shallow slot, and no board
+// shape lets one clear three rows.
+static const uint16_t TSPIN_MINI_POINTS_DEFAULT[3] = {100, 200, 400};
+
+#define TB_COMBO_POINTS_DEFAULT          50u
+#define TB_PERFECT_CLEAR_POINTS_DEFAULT 3500u
+#define TB_SOFT_DROP_POINTS_DEFAULT        1u
+#define TB_HARD_DROP_POINTS_DEFAULT        2u
 
 // shape table (used tetrio for reference)
 
@@ -193,7 +214,9 @@ static bool try_rotate(tb_game *g, bool clockwise)
     // would only shove it sideways for no visual reason.
     if (g->active.type == TB_O) {
         if (!tb_block_fits(g, &nb)) return false;
-        g->active = nb;
+        g->active            = nb;
+        g->last_was_rotation = true;
+        g->last_rotation_kicked = false;
         return true;
     }
 
@@ -207,10 +230,51 @@ static bool try_rotate(tb_game *g, bool clockwise)
         cand.origin.y = (int8_t)(cand.origin.y - table[from][t].dy);  // y is flipped
         if (tb_block_fits(g, &cand)) {
             g->active = cand;
+            // Test 0 is the plain rotation, so anything past it needed a kick.
+            // That distinction is the whole mini/full t-spin rule: a spin that
+            // fit without help had room to begin with.
+            g->last_was_rotation    = true;
+            g->last_rotation_kicked = (t > 0);
             return true;
         }
     }
     return false;                        // all five tests blocked
+}
+
+// rotates the active piece 180 degrees (two orientation steps) in one input.
+// SRS publishes no 180 table -- guideline games each invent their own -- so
+// this uses a deliberately small, documented set: the plain rotation, one
+// column left or right, then one row up. Same first-fit commit rule as
+// try_rotate, and the same O-piece exemption from kicking.
+static bool try_rotate_180(tb_game *g)
+{
+    tb_block nb = g->active;
+    uint8_t from = (uint8_t)(nb.orientation % TB_NUM_ORIENTATIONS);
+    nb.orientation = (uint8_t)((from + 2) % TB_NUM_ORIENTATIONS);
+
+    if (g->active.type == TB_O) {
+        if (!tb_block_fits(g, &nb)) return false;
+        g->active               = nb;
+        g->last_was_rotation    = true;
+        g->last_rotation_kicked = false;
+        return true;
+    }
+
+    // dx/dy in this engine's screen coordinates (y points down), so -1 dy
+    // means "try one row up" -- no published-table sign flip to worry about.
+    static const tb_kick kicks_180[4] = {{0,0}, {+1,0}, {-1,0}, {0,-1}};
+    for (size_t t = 0; t < sizeof kicks_180 / sizeof kicks_180[0]; t++) {
+        tb_block cand = nb;
+        cand.origin.x = (int8_t)(cand.origin.x + kicks_180[t].dx);
+        cand.origin.y = (int8_t)(cand.origin.y + kicks_180[t].dy);
+        if (tb_block_fits(g, &cand)) {
+            g->active               = cand;
+            g->last_was_rotation    = true;
+            g->last_rotation_kicked = (t > 0);
+            return true;
+        }
+    }
+    return false;
 }
 
 // applies one movement action to the active piece, committing it only if
@@ -227,6 +291,10 @@ static bool move_block(tb_game *g, tb_action a)
         // slide down until blocked; a drop cannot fail, it just may not move
         do { nb.origin.y++; } while (tb_block_fits(g, &nb));
         nb.origin.y--;                              // back off one row
+        // A hard drop that travels zero rows leaves the piece exactly where a
+        // rotation put it, so it must NOT clear the spin flag: rotating a T
+        // into its slot and slamming it is the normal way to finish a t-spin.
+        if (nb.origin.y != g->active.origin.y) g->last_was_rotation = false;
         g->active = nb;                             // a drop always commits
         return true;
     case MV_ROTATE_CW:  return try_rotate(g, true);
@@ -234,6 +302,9 @@ static bool move_block(tb_game *g, tb_action a)
     }
     // plain left/right/down: commit only if the shifted position is legal
     if (!tb_block_fits(g, &nb)) return false;
+    // Any translation that lands ends a spin, gravity's own step included --
+    // a piece that fell after being rotated was not spun into place.
+    g->last_was_rotation = false;
     g->active = nb;
     return true;
 }
@@ -275,14 +346,126 @@ static int clear_lines(tb_game *g)
     return cleared;
 }
 
-// awards points for a clear (classic table value times level), then
-// advances the level every TB_LINES_PER_LEVEL lines, speeding up gravity
-// each time it does.
-static void score_lines(tb_game *g, int rows)
+// is every play cell empty? only meaningful right after a clear, where it
+// means the player emptied the board outright and earns a perfect clear.
+static bool board_is_empty(const tb_game *g)
 {
-    // rows is always 1..4: clear_lines re-checks one row at a time and this
-    // engine's pieces cannot span more than 4 rows.
-    g->score += (uint32_t)g->tetris_points[rows - 1] * g->level;
+    for (int y = 1; y <= TB_ROWS; y++)
+        for (int x = 1; x <= TB_COLS; x++)
+            if (g->cells[y][x] != TB_CELL_EMPTY) return false;
+    return true;
+}
+
+// recognises whether the piece about to lock is a t-spin, using the standard
+// 3-corner rule: it has to be a T, it has to have arrived by rotation rather
+// than by a move or by gravity, and at least three of the four cells diagonally
+// touching the T's centre have to be occupied.
+//
+// Must be called BEFORE freeze_block and clear_lines: it reads the board around
+// the piece, and both of those rewrite exactly that.
+static tb_clear_kind detect_clear_kind(const tb_game *g)
+{
+    if (g->active.type != TB_T)  return TB_CLEAR_NORMAL;
+    if (!g->last_was_rotation)   return TB_CLEAR_NORMAL;
+
+    // Every T orientation in tb_positions puts the centre of the piece at
+    // origin + (2,1), so one set of diagonal offsets covers all four.
+    static const tb_point corners[4] = {{1,0}, {3,0}, {1,2}, {3,2}};
+    // The two corners flanking the T's pointing face, per orientation, indexed
+    // into corners[] above. Orientation 0 points up, 1 right, 2 down, 3 left.
+    static const uint8_t front[TB_NUM_ORIENTATIONS][2] = {
+        {0, 1}, {1, 3}, {2, 3}, {0, 2},
+    };
+
+    bool filled[4];
+    int occupied = 0;
+    for (int i = 0; i < 4; i++) {
+        int bx = g->active.origin.x + corners[i].x + 1;   // +1 folds in the border
+        int by = g->active.origin.y + corners[i].y + 1;
+        // Off the array counts as occupied, for the same reason the sentinel
+        // border exists: a corner outside the world is not a gap a player could
+        // have filled, and indexing past cells[] would be undefined behaviour.
+        filled[i] = (by < 0 || by >= TB_BH || bx < 0 || bx >= TB_BW)
+                 || (g->cells[by][bx] != TB_CELL_EMPTY);
+        if (filled[i]) occupied++;
+    }
+    if (occupied < 3) return TB_CLEAR_NORMAL;
+
+    // A spin that needed a kick AND left a gap at its pointing face went into a
+    // shallow slot rather than a true pocket, which is what "mini" describes.
+    const uint8_t *f = front[g->active.orientation % TB_NUM_ORIENTATIONS];
+    bool both_front_filled = filled[f[0]] && filled[f[1]];
+    return (g->last_rotation_kicked && !both_front_filled) ? TB_CLEAR_TSPIN_MINI
+                                                           : TB_CLEAR_TSPIN;
+}
+
+// awards everything one locked piece earned -- base clear value with the
+// back-to-back multiplier, then the t-spin, combo and perfect-clear bonuses on
+// top -- updates the two chain counters, and finally advances the level every
+// TB_LINES_PER_LEVEL lines, speeding up gravity each time it does.
+static void score_lines(tb_game *g, int rows, tb_clear_kind kind)
+{
+    bool tspin = (kind != TB_CLEAR_NORMAL);
+    bool mini  = (kind == TB_CLEAR_TSPIN_MINI);
+
+    // "Difficult" in guideline terms: a quad, or a t-spin that cleared lines.
+    // Those are the only clears the back-to-back chain recognises.
+    bool difficult = (rows == 4) || (tspin && rows > 0);
+
+    // Accumulated unmultiplied, then scaled by level once at the end, so every
+    // award here scales identically. The drop rewards in tb_tick are the sole
+    // exception and are added there, deliberately outside this function.
+    uint32_t award = 0;
+
+    if (rows > 0) {
+        // rows is 1..4: clear_lines re-checks one row at a time and this
+        // engine's pieces cannot span more than 4 rows.
+        uint32_t base = (uint32_t)g->tetris_points[rows - 1];
+        // Back-to-back pays one and a half times the BASE value only; the
+        // bonuses below are added afterwards so the chain never compounds with
+        // them. Integer (base * 3) / 2 truncates, so an odd base rounds DOWN --
+        // with the default table every value is even, so nothing is lost today,
+        // and a variant ruleset with odd values loses at most half a point.
+        if (difficult && g->b2b_count > 0)
+            base = (base * 3u) / 2u;
+        award += base;
+    }
+
+    if (tspin) {
+        // A T occupies at most three rows in any orientation, so rows can never
+        // reach 4 here; the clamp is belt and braces against a future shape
+        // table quietly reading past the array.
+        int ti = (rows < 4) ? rows : 3;
+        // A mini has no three-row form, so a mini that somehow cleared three
+        // rows falls back to the full triple rather than reading past the
+        // shorter mini table.
+        award += (mini && ti < 3) ? (uint32_t)g->tspin_mini_points[ti]
+                                  : (uint32_t)g->tspin_points[ti];
+    }
+
+    // Combo counts the pieces that cleared BEFORE this one, so the first clear
+    // of a chain adds nothing and each one after it adds another unit.
+    if (rows > 0 && g->combo_count > 0)
+        award += (uint32_t)g->combo_points * g->combo_count;
+
+    if (rows > 0 && board_is_empty(g))
+        award += g->perfect_clear_points;
+
+    g->score += award * g->level;
+    g->last_clear_kind = kind;
+
+    // Chain bookkeeping. A piece that cleared nothing resets the combo but
+    // leaves back-to-back alone -- you may take as long as you like setting the
+    // next quad up. Only an ordinary line clear breaks the b2b chain.
+    if (rows > 0) {
+        g->combo_count++;
+        g->b2b_count = difficult ? g->b2b_count + 1 : 0;
+    } else {
+        g->combo_count = 0;
+    }
+
+    if (rows == 0) return;                  // nothing below concerns a dry lock
+
     g->lines_total += (uint32_t)rows;
     g->lines_since_level = (uint8_t)(g->lines_since_level + rows);
     // level up once per full batch of lines, shaving the gravity period
@@ -377,20 +560,32 @@ void tb_spawn(tb_game *g, tb_piece_type type)
     g->active.type        = type;
     g->active.orientation = 0;
     g->active.origin      = SPAWN_ORIGIN;
+    // A piece that has just appeared has no rotation history, so it cannot be
+    // a t-spin yet. Resetting here rather than in lock_and_next covers the hold
+    // swap too, which spawns without anything locking.
+    g->last_was_rotation    = false;
+    g->last_rotation_kicked = false;
     if (!tb_block_fits(g, &g->active)) {
         g->game_over  = true;
         g->over_cause = TB_OVER_BLOCKOUT;
     }
 }
 
-// the end of one piece's life: freeze it into the board, clear and score
-// any full rows, spawn the next piece, and reset all the per-piece state
-// (gravity phase, lock delay allowance, hold availability).
+// the end of one piece's life: recognise what the placement was, freeze it
+// into the board, clear and score any full rows, spawn the next piece, and
+// reset all the per-piece state (gravity phase, lock delay allowance, hold
+// availability).
 static void lock_and_next(tb_game *g)
 {
+    // Before freeze_block, which writes the piece into the cells the corner
+    // test reads, and before clear_lines, which deletes rows out from under it.
+    tb_clear_kind kind = detect_clear_kind(g);
+
     freeze_block(g);
     int rows = clear_lines(g);
-    if (rows) score_lines(g, rows);
+    // Called unconditionally now, not just when rows > 0: a t-spin that clears
+    // nothing still scores, and a dry lock is what resets the combo chain.
+    score_lines(g, rows, kind);
     tb_spawn(g, next_from_bag(g));
     g->ticks_since_grav = 0;
     // The new piece gets a fresh allowance. Carrying the old piece's spent
@@ -416,6 +611,13 @@ void tb_init(tb_game *g, uint32_t seed)
     g->bag_index      = TB_NUM_PIECES;              // force refill on first draw
     g->lock_delay_ticks = TB_LOCK_DELAY_TICKS;      // 500 ms at tick_hz 20
     memcpy(g->tetris_points, TETRIS_POINTS_DEFAULT, sizeof(g->tetris_points));
+    memcpy(g->tspin_points, TSPIN_POINTS_DEFAULT, sizeof(g->tspin_points));
+    memcpy(g->tspin_mini_points, TSPIN_MINI_POINTS_DEFAULT,
+           sizeof(g->tspin_mini_points));
+    g->combo_points         = TB_COMBO_POINTS_DEFAULT;
+    g->perfect_clear_points = TB_PERFECT_CLEAR_POINTS_DEFAULT;
+    g->soft_drop_points     = TB_SOFT_DROP_POINTS_DEFAULT;
+    g->hard_drop_points     = TB_HARD_DROP_POINTS_DEFAULT;
     g->hold           = -1;                         // memset already zeroed held_this_turn
     g->start_level    = g->level;
     tb_spawn(g, next_from_bag(g));
@@ -481,18 +683,34 @@ bool tb_tick(tb_game *g, tb_input input)
     case TB_INPUT_RIGHT:      moved = move_block(g, MV_RIGHT);      break;
     case TB_INPUT_ROTATE_CW:  moved = move_block(g, MV_ROTATE_CW);  break;
     case TB_INPUT_ROTATE_CCW: moved = move_block(g, MV_ROTATE_CCW); break;
+    case TB_INPUT_ROTATE_180: moved = try_rotate_180(g);            break;
     case TB_INPUT_SOFT_DROP:
         // A soft drop nudges the piece down but no longer locks it on contact.
         // Locking is the lock delay's job now, which is what gives the player
         // the grace period to slide it at the last moment.
-        if (move_block(g, MV_DOWN)) { g->ticks_since_grav = 0; moved = true; }
+        if (move_block(g, MV_DOWN)) {
+            g->ticks_since_grav = 0;
+            moved = true;
+            // Drop rewards are flat, never times level: they pay for the row a
+            // player chose not to wait for, and that row is worth the same
+            // whatever speed the game is running at.
+            g->score += g->soft_drop_points;
+        }
         break;
-    case TB_INPUT_HARD_DROP:
+    case TB_INPUT_HARD_DROP: {
         // A hard drop is the one input that deliberately skips lock delay.
         // Slamming a piece down is a commitment.
+        //
+        // The distance has to be measured BEFORE the move, since afterwards the
+        // piece is sitting on the ghost row and the gap is zero. tb_ghost_y is
+        // pure and never returns a row above the piece, so this cannot go
+        // negative.
+        uint32_t fallen = (uint32_t)(tb_ghost_y(g) - g->active.origin.y);
+        g->score += fallen * g->hard_drop_points;
         move_block(g, MV_DROP);
         lock_and_next(g);
         return !g->game_over;
+    }
     case TB_INPUT_HOLD:
         // A successful hold replaces the active piece outright, so lock
         // delay/gravity for this tick apply to the new piece next tick rather

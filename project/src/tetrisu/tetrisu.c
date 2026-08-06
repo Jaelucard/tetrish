@@ -17,6 +17,14 @@
 #include "local.h"
 
 #define FRAME_MS    16       // ~60 Hz; also the gravity time base
+// The engine's default lock delay (TB_LOCK_DELAY_TICKS = 10) is "500 ms at
+// tick_hz 20" -- the SERVER's tick rate. This loop ticks the engine at ~60
+// Hz, where 10 ticks is a barely-perceptible 170 ms, so pieces feel like
+// they cement on contact. Re-express the same half second in local frames:
+// touching down starts this timer, and each successful shift/rotate resets
+// it (up to TB_LOCK_MAX_RESETS), which is the slide-into-the-gap grace the
+// move-reset rule exists for.
+#define LOCK_DELAY_FRAMES  (500 / FRAME_MS)
 #define CELL_W       2       // each board cell is 2 terminal columns wide
 #define BOARD_TOP    1
 #define BOARD_LEFT   2
@@ -85,9 +93,9 @@ static void draw_piece_box(int top, int left, const char *label, int type, bool 
 }
 
 // redraws the whole screen for one frame: board (with ghost overlay),
-// NEXT/HOLD side boxes, score footer, and the game-over banner. reads the
-// game, never mutates it.
-static void draw(const tb_game *g)
+// NEXT/HOLD side boxes, the control list, score footer, and the
+// game-over/paused banner. reads the game, never mutates it.
+static void draw(const tb_game *g, bool paused)
 {
     // ask the engine for the merged board, and compute the ghost overlay
     int8_t view[TB_ROWS][TB_COLS];
@@ -119,34 +127,63 @@ static void draw(const tb_game *g)
     draw_piece_box(BOARD_TOP,     SIDE_LEFT, "NEXT", tb_next_piece(g), false);
     draw_piece_box(BOARD_TOP + 6, SIDE_LEFT, "HOLD", g->hold, g->held_this_turn);
 
+    // The control list, always on screen next to the board. Kept as data so
+    // the drawing loop and any future width checks share one source of truth.
+    static const char *controls[] = {
+        "CONTROLS",
+        "left/right move",
+        "down     soft drop",
+        "space    hard drop",
+        "up / x   rotate cw",
+        "z        rotate ccw",
+        "a        rotate 180",
+        "c        hold",
+        "r        retry",
+        "q / esc  pause",
+    };
+    for (size_t i = 0; i < sizeof controls / sizeof controls[0]; i++) {
+        if (i > 0) attron(A_DIM);
+        mvprintw(BOARD_TOP + 12 + (int)i, SIDE_LEFT, "%s", controls[i]);
+        if (i > 0) attroff(A_DIM);
+    }
+
     int footer = BOARD_TOP + TB_ROWS + 2;
     mvprintw(footer,     BOARD_LEFT, "Score: %u  |  Lines: %u  |  Level: %u",
              g->score, g->lines_total, g->level);
-    mvprintw(footer + 1, BOARD_LEFT,
-             "left/right move - up rotate - down soft - space drop - c hold - q quit");
 
     if (g->game_over) {
         int my = BOARD_TOP + TB_ROWS / 2;
         attron(A_BOLD);
-        mvprintw(my,     BOARD_LEFT + 3, " GAME OVER ");
-        mvprintw(my + 1, BOARD_LEFT + 3, " press q   ");
+        mvprintw(my,     BOARD_LEFT + 2, "    GAME OVER     ");
+        mvprintw(my + 1, BOARD_LEFT + 2, " r retry - q quit ");
+        attroff(A_BOLD);
+    } else if (paused) {
+        int my = BOARD_TOP + TB_ROWS / 2;
+        attron(A_BOLD);
+        mvprintw(my,     BOARD_LEFT + 2, "      PAUSED      ");
+        mvprintw(my + 1, BOARD_LEFT + 2, " q resume  r retry");
+        mvprintw(my + 2, BOARD_LEFT + 2, " shift-q   quit   ");
         attroff(A_BOLD);
     }
     refresh();
 }
 
 // Map a keypress to an engine input. ERR (no key this frame) -> NONE.
+// Letters accept both cases EXCEPT q/Q, which are two different commands
+// (pause vs quit) and are handled in the loop, not here.
 static tb_input key_to_input(int ch)
 {
     switch (ch) {
-    case KEY_LEFT:  return TB_INPUT_LEFT;
-    case KEY_RIGHT: return TB_INPUT_RIGHT;
-    case KEY_UP:    return TB_INPUT_ROTATE_CW;
-    case 'z':      return TB_INPUT_ROTATE_CCW;
-    case KEY_DOWN:  return TB_INPUT_SOFT_DROP;
-    case ' ':       return TB_INPUT_HARD_DROP;
-    case 'c':       return TB_INPUT_HOLD;
-    default:        return TB_INPUT_NONE;
+    case KEY_LEFT:            return TB_INPUT_LEFT;
+    case KEY_RIGHT:           return TB_INPUT_RIGHT;
+    case KEY_UP:
+    case 'x': case 'X':       return TB_INPUT_ROTATE_CW;
+    case 'z': case 'Z':       return TB_INPUT_ROTATE_CCW;
+    case 'a': case 'A':       return TB_INPUT_ROTATE_180;
+    case KEY_DOWN:            return TB_INPUT_SOFT_DROP;
+    case ' ':                 return TB_INPUT_HARD_DROP;
+    case 'c': case 'C':       return TB_INPUT_HOLD;
+    default:                  return TB_INPUT_NONE;
     }
 }
 
@@ -170,23 +207,38 @@ int tetrisu_local_run(uint32_t seed, uint32_t start_level)
 
     // a 0 seed means "give me a different game each run"; an explicit seed
     // reproduces the exact same piece sequence (that is the determinism
-    // contract, and it is how replays work)
+    // contract, and it is how replays work). Retry follows the same rule:
+    // an explicit seed replays the identical piece sequence, no seed rolls
+    // a fresh one, so `--local 42` is practice mode and `--local` is arcade.
     tb_game g;
     tb_init(&g, seed ? seed : (uint32_t)time(NULL));
+    tb_set_lock_delay(&g, LOCK_DELAY_FRAMES);
     if (start_level > 0)
         tb_set_start_level(&g, start_level);
 
-    // ~60 Hz frame loop; the engine only advances while the game is live,
-    // but drawing continues so the game-over banner stays up
+    // ~60 Hz frame loop; the engine only advances while the game is live
+    // and unpaused, but drawing continues so the banners stay up.
+    // q (or esc) pauses; from pause or game over, r restarts; shift-q (or
+    // q on the game-over screen) quits.
+    bool paused = false;
     while (!g_quit) {
         int ch = getch();
-        if (ch == 'q')
+
+        if (ch == 'Q' || (g.game_over && (ch == 'q' || ch == 27)))
             break;
-
-        if (!g.game_over)
+        if (ch == 'r' || ch == 'R') {
+            tb_init(&g, seed ? seed : (uint32_t)time(NULL));
+            tb_set_lock_delay(&g, LOCK_DELAY_FRAMES);
+            if (start_level > 0)
+                tb_set_start_level(&g, start_level);
+            paused = false;
+        } else if (!g.game_over && (ch == 'q' || ch == 27)) {
+            paused = !paused;
+        } else if (!g.game_over && !paused) {
             tb_tick(&g, key_to_input(ch));
+        }
 
-        draw(&g);
+        draw(&g, paused);
         napms(FRAME_MS);
     }
 
