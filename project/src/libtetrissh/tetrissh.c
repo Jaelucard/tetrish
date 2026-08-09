@@ -43,6 +43,12 @@
 
 #include "tetrissh.h"
 
+/* macOS has no MSG_NOSIGNAL; the equivalent SIGPIPE suppression is done
+ * per-socket with SO_NOSIGPIPE inside send_all() instead. */
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
 /* ─────────────────────────── session struct ─────────────────────────────── */
 
 struct tetrissh_session {
@@ -82,6 +88,13 @@ static void _err(tetrissh_session_t *sess, const char *msg) {
  */
 static int send_all(int fd, const void *buf, size_t len)
 {
+#ifdef __APPLE__
+    /* Darwin's replacement for MSG_NOSIGNAL: a write to a dead peer returns
+     * EPIPE instead of raising SIGPIPE. Setting it per call is idempotent
+     * and costs one cheap syscall next to the encryption work per frame. */
+    int nosigpipe = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof nosigpipe);
+#endif
     const unsigned char *p = buf;
     while (len > 0) {
         ssize_t n = send(fd, p, len, MSG_NOSIGNAL);

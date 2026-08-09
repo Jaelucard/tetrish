@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <sys/socket.h>
@@ -69,9 +70,11 @@ int main(int argc, char **argv){
     long n_records = (argc > 2) ? strtol(argv[2], NULL, 10) : 100000;
 
     // Set the socket up the same way tetrisd's log_init() does: a datagram
-    // socket in non-blocking mode.
-    sock_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    // socket in non-blocking mode (via fcntl rather than Linux's
+    // SOCK_NONBLOCK type flag, so this builds on macOS too).
+    sock_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
     if (sock_fd < 0){ perror("socket"); return 1; }
+    fcntl(sock_fd, F_SETFL, fcntl(sock_fd, F_GETFL, 0) | O_NONBLOCK);
     memset(&dst, 0, sizeof dst);
     dst.sun_family = AF_UNIX;
     strncpy(dst.sun_path, argv[1], sizeof dst.sun_path - 1);
