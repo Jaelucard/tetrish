@@ -1,0 +1,5 @@
+# Week 9-11 admin token table: <token> <role>
+# roles: readonly (ADMIN-STATUS, ADMIN-ROOMS, ADMIN-ATTACH)
+#      | full     (+ ADMIN-KICK, the one mutating admin action)
+alice-readonly-tok    readonly
+bob-full-tok          full

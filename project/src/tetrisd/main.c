@@ -52,6 +52,7 @@
 #include <sys/timerfd.h>     // per-room tickers
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>            // clock_gettime, CLOCK_MONOTONIC (rate limiter)
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/un.h>
@@ -63,6 +64,24 @@
 #include "htttp.h"           // NET teammate: HTTTP parse/serialise
 #include "clients.h"
 #include "rooms.h"
+#include "admin.h"
+
+// struct jbuf is a tiny fixed-buffer JSON-array builder, originally written
+// for the control-plane's /status and /rooms handlers (see the big block
+// below this file's dispatch_request()). The Week 9/10 ADMIN-STATUS and
+// ADMIN-ROOMS methods reuse the exact same builder and the exact same
+// jb_append/jb_room functions -- one JSON shape, two transports (the local
+// ctl socket and the encrypted session), rather than two implementations
+// that could drift apart. The type has to be visible here, before
+// dispatch_request, even though the function bodies stay defined further
+// down where the rest of the control-plane code lives.
+struct jbuf { char buf[4096]; size_t off; int first; };
+static void jb_append(struct jbuf *j, const char *fmt, ...);
+static void jb_room(room_t *r, void *arg);
+
+// Loaded once at startup from auth/admin_tokens (see admin.h). Empty table
+// (all ADMIN-* requests get 401) if the file doesn't exist.
+static admin_table_t g_admin_table;
 
 #define GARBAGE_MSG_MAX 128  // must match the mq_msgsize attribute below
 
@@ -262,6 +281,27 @@ static int check_player_id(client_t *c, const htttp_msg_t *msg){
     return 0;
 }
 
+// Week 11: ADMIN-KICK needs to find a specific player's connection given
+// only (room id, player id) from the URL -- unlike every other handler,
+// which already has the right client_t* because the request arrived on
+// that player's own connection.
+typedef struct { const char *rid; const char *pid; client_t *found; } find_ctx_t;
+
+static void find_client_cb(client_t *c, void *arg){
+    find_ctx_t *ctx = arg;
+    if (ctx->found) return;                     // already found, skip the rest
+    if (strcmp(c->player_id, ctx->pid) != 0) return;
+    room_t *r = room_at(c->room);
+    if (r == NULL || strcmp(r->id, ctx->rid) != 0) return;
+    ctx->found = c;
+}
+
+static client_t *find_client_in_room(const char *rid, const char *pid){
+    find_ctx_t ctx = { .rid = rid, .pid = pid, .found = NULL };
+    client_foreach(find_client_cb, &ctx);
+    return ctx.found;
+}
+
 // --- room lifecycle handlers ---------------------------------------------------
 
 // Declared ahead of time because disconnecting a client and cleaning up a room
@@ -452,6 +492,95 @@ static void dispatch_request(client_t *c, const htttp_msg_t *msg){
         break;
     }
 
+    // Week 9-11: ops-console admin protocol. Same session, same libhtttp
+    // grammar as game clients -- only the method names and the
+    // Admin-Token-based role check are different. See admin.h and the
+    // README's "Admin protocol" section for the full spec.
+    //
+    // Role check happens ONCE, here, before any method-specific handler
+    // logic runs -- "checked before dispatch" per the Week 11 deliverable.
+    // ADMIN-STATUS/ADMIN-ROOMS/ADMIN-ATTACH only need ADMIN_ROLE_READONLY;
+    // ADMIN-KICK is the one mutating action and needs ADMIN_ROLE_FULL.
+    case HTTTP_METHOD_ADMIN_STATUS:
+    case HTTTP_METHOD_ADMIN_ROOMS:
+    case HTTTP_METHOD_ADMIN_ATTACH:
+    case HTTTP_METHOD_ADMIN_KICK: {
+        size_t tok_len = 0;
+        const char *tok_ptr = htttp_find_header(msg, "Admin-Token", &tok_len);
+        char token[ADMIN_TOKEN_LEN] = {0};
+        if (tok_ptr && tok_len > 0 && tok_len < sizeof token) {
+            memcpy(token, tok_ptr, tok_len);
+        }
+        admin_role_t role = admin_table_lookup(&g_admin_table, token);
+        c->admin_role = role;
+
+        if (role == ADMIN_ROLE_NONE) {
+            status = send_response(c, HTTTP_401_UNAUTHORIZED, "{\"error\": \"missing or unknown Admin-Token\"}", NULL);
+            break;
+        }
+
+        admin_role_t required = (msg->method == HTTTP_METHOD_ADMIN_KICK)
+                                 ? ADMIN_ROLE_FULL : ADMIN_ROLE_READONLY;
+        if (role < required) {
+            char body[192];
+            admin_forbidden_body(body, sizeof body, msg->method_str, role, required);
+            status = send_response(c, HTTTP_403_FORBIDDEN, body, NULL);
+            break;
+        }
+
+        // --- past this point, the role check has already passed; every
+        // branch below is a normal "does this request make sense" check,
+        // not an authorization check. ---
+
+        if (msg->method == HTTTP_METHOD_ADMIN_STATUS) {
+            char body[256];
+            snprintf(body, sizeof body,
+                     "{\"rooms\": %d, \"players\": %d, \"dropped_logs\": %lu, \"your_role\": \"%s\"}",
+                     rooms_count(), client_count(), total_dropped(), admin_role_str(role));
+            status = send_response(c, HTTTP_200_OK, body, NULL);
+
+        } else if (msg->method == HTTTP_METHOD_ADMIN_ROOMS) {
+            struct jbuf j = {0};
+            jb_append(&j, "[");
+            rooms_foreach(jb_room, &j);
+            jb_append(&j, "]");
+            status = send_response(c, HTTTP_200_OK, j.buf, NULL);
+
+        } else if (msg->method == HTTTP_METHOD_ADMIN_ATTACH) {
+            if (pathkind != 0) {
+                status = send_response(c, HTTTP_400_BAD_REQUEST, "{\"error\": \"bad path\"}", NULL);
+                break;
+            }
+            if (room_find(rid) == NULL) {
+                status = send_response(c, HTTTP_404_NOT_FOUND, "{\"error\": \"no such room\"}", NULL);
+                break;
+            }
+            snprintf(c->attach_room_id, sizeof c->attach_room_id, "%s", rid);
+            status = send_response(c, HTTTP_200_OK, "{\"ok\": true, \"attached\": true}", NULL);
+
+        } else { // HTTTP_METHOD_ADMIN_KICK: path must be /room/<rid>/player/<pid>
+            if (pathkind != 1) {
+                status = send_response(c, HTTTP_400_BAD_REQUEST,
+                                       "{\"error\": \"path must be /room/<id>/player/<id>\"}", NULL);
+                break;
+            }
+            client_t *target = find_client_in_room(rid, pid);
+            if (target == NULL) {
+                status = send_response(c, HTTTP_404_NOT_FOUND, "{\"error\": \"no such player in that room\"}", NULL);
+                break;
+            }
+            char kicked_room[ROOM_ID_MAX]; snprintf(kicked_room, sizeof kicked_room, "%s", rid);
+            char kicked_pid[CLIENT_ID_MAX]; snprintf(kicked_pid, sizeof kicked_pid, "%s", target->player_id);
+            int target_fd = target->fd;
+            slog("info", "admin: %s kicked %s from room %s", admin_role_str(role), kicked_pid, kicked_room);
+            char body[160];
+            snprintf(body, sizeof body, "{\"ok\": true, \"kicked\": \"%s\", \"room\": \"%s\"}", kicked_pid, kicked_room);
+            status = send_response(c, HTTTP_200_OK, body, NULL);
+            disconnect_client(target_fd, "kicked by admin");
+        }
+        break;
+    }
+
     default:
         status = send_response(c, HTTTP_400_BAD_REQUEST, "{\"error\": \"unknown method\"}", NULL);
         break;
@@ -463,6 +592,22 @@ static void dispatch_request(client_t *c, const htttp_msg_t *msg){
 
 // A connected client's socket has data to read. One encrypted frame becomes
 // one request.
+//
+// Rate limiting: a simple fixed-window counter per connection. More than
+// CLIENT_RATE_LIMIT_MAX requests within CLIENT_RATE_LIMIT_WINDOW_MS gets a
+// 429 instead of being dispatched. This is deliberately simple (a sliding
+// window or token bucket would be smoother) but it is enough to make the
+// required status code reachable and to stop a single connection from
+// hammering the room/game locks.
+#define CLIENT_RATE_LIMIT_WINDOW_MS 1000
+#define CLIENT_RATE_LIMIT_MAX       50
+
+static long now_ms(void){
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 static void handle_client_data(int fd){
     client_t *c = client_get(fd);
     if (c == NULL){                    // defensive: unknown fd in the set
@@ -474,10 +619,34 @@ static void handle_client_data(int fd){
     size_t plen = 0;
     unsigned char *plain = tetrissh_recv(c->sess, fd, &plen);   // malloc'd
     if (plain == NULL){
-        // This one path covers a clean close, a failed decrypt, and a timeout.
-        // We deliberately treat them all the same and do not report different
-        // errors, so that an attacker cannot learn anything from how we fail.
+        // Oversized frames are the one failure mode we *do* distinguish and
+        // answer explicitly (413), because frame size is observable on the
+        // wire anyway (TCP byte counting), so replying does not create a
+        // new oracle. Every other failure here (clean close, bad decrypt,
+        // timeout) stays lumped together and silent, per the note above.
+        if (tetrissh_last_recv_was_oversized(c->sess)){
+            slog("warn", "%s: oversized frame (>%d bytes), replying 413",
+                 c->player_id, TETRISSH_MAX_FRAME_LEN);
+            send_response(c, HTTTP_413_PAYLOAD_TOO_LARGE,
+                         "{\"error\": \"frame exceeds 64 KiB cap\"}", NULL);
+        }
         disconnect_client(fd, "connection closed or bad frame");
+        return;
+    }
+
+    // Rate limit: count this request against the connection's current
+    // window, resetting the window once it has elapsed.
+    long t = now_ms();
+    if (c->rl_window_start_ms == 0 || t - c->rl_window_start_ms >= CLIENT_RATE_LIMIT_WINDOW_MS){
+        c->rl_window_start_ms = t;
+        c->rl_count = 0;
+    }
+    c->rl_count++;
+    if (c->rl_count > CLIENT_RATE_LIMIT_MAX){
+        slog("warn", "%s: rate limit exceeded (%d req in window), replying 429",
+             c->player_id, c->rl_count);
+        send_response(c, HTTTP_429_TOO_MANY_REQUESTS, "{\"error\": \"too many requests\"}", NULL);
+        free(plain);
         return;
     }
 
@@ -573,6 +742,22 @@ static size_t render_board(char *dst, size_t cap, const char *pid, const tb_game
     return off;
 }
 
+// Week 9/10: ADMIN-ATTACH spectators. Same STATE wire bytes the room's own
+// players get, fanned out to any connection that attached to this room id
+// via admin.h's operator-role check. Read-only: this never touches game
+// state, only reads it, so it cannot interfere with the players any more
+// than the room's own tick already does.
+typedef struct { const char *room_id; const char *wire; size_t wlen; int failed[64]; int nfailed; } spectate_ctx_t;
+
+static void spectate_send(client_t *c, void *arg) {
+    spectate_ctx_t *ctx = arg;
+    if (c->attach_room_id[0] == '\0') return;
+    if (strcmp(c->attach_room_id, ctx->room_id) != 0) return;
+    if (tetrissh_send(c->sess, c->fd, (unsigned char *)ctx->wire, ctx->wlen) != 0) {
+        if (ctx->nfailed < 64) ctx->failed[ctx->nfailed++] = c->fd;
+    }
+}
+
 static void handle_room_tick(room_t *r){
     // Read how many times the timer has fired since we last checked. Normally
     // this is 1. If the loop fell behind, for example because a slow handshake
@@ -636,6 +821,15 @@ static void handle_room_tick(room_t *r){
                           (unsigned char *)wire, wlen) != 0)
             failed[nfailed++] = recipients[i]->fd;
     }
+
+    // Spectators: same wire bytes, sent after the real players so a slow
+    // spectator can never delay gameplay traffic. Must happen before wire
+    // is freed below.
+    spectate_ctx_t sctx = { .room_id = r->id, .wire = wire, .wlen = wlen, .nfailed = 0 };
+    client_foreach(spectate_send, &sctx);
+    for (int i = 0; i < sctx.nfailed; i++)
+        disconnect_client(sctx.failed[i], "STATE send failed (slow admin spectator)");
+
     free(wire);
 
     // If a client cannot receive a STATE frame within the 5 second send
@@ -695,8 +889,6 @@ static void handle_garbage(mqd_t mq){
 // attacker who can already open local sockets as us, so it would add work for
 // no real benefit. The channel still speaks real HTTTP through libhtttp, as the
 // assignment requires.
-
-struct jbuf { char buf[4096]; size_t off; int first; };
 
 static void jb_append(struct jbuf *j, const char *fmt, ...){
     va_list ap;
@@ -804,6 +996,8 @@ int main(int argc, char **argv){
         return 1;
     }
     rooms_init(g_cfg.max_rooms, g_cfg.max_players_per_room);
+    admin_table_load("auth/admin_tokens", &g_admin_table);
+    slog("info", "admin: loaded %d token(s) from auth/admin_tokens", g_admin_table.count);
 
     // 2. Deal with signals. First we ignore SIGPIPE. We write to network peers
     //    that may disconnect at any time, and without this a write to a peer

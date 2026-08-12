@@ -1,10 +1,3 @@
-// #include <stdio.h>
-
-// int main(void) {
-//     puts("tetrisu: not yet implemented");
-//     return 0;
-// }
-
 // tetrisu/main.c — the network game client.
 //
 // Pipeline: TCP connect -> libtetrissh client handshake -> libhtttp
@@ -198,7 +191,7 @@ int main(int argc, char **argv) {
     free(resp_buf);
 
     printf("tetrisu: JOIN -> %d, assigned Player-Id: %s\n", (int)resp.status, player_id);
-    printf("tetrisu: press the key g to start playing...\n");
+    printf("tetrisu: press any key to start playing...\n");
 
     // --- interactive loop -------------------------------------------------
     enable_raw_mode();

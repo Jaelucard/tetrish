@@ -34,7 +34,11 @@ LIB_HTTTP := $(LIBDIR)/libhtttp.a
 LIB_BRAIN := $(LIBDIR)/libtetrisbrain.a
 LIBS      := $(LIB_SSH) $(LIB_HTTTP) $(LIB_BRAIN)
 
-SSH_OBJ   := $(BUILDDIR)/common/secure_session.o $(BUILDDIR)/libtetrissh/tetrissh.o
+# libtetrissh is now two objects: the standardised corestack implementation
+# (shared verbatim with the 50.003 mini-gh-tracker app -- real handshake
+# crypto, no OpenSSL SSL_*/TLS) plus a thin shim exposing it under
+# tetrisd/tetrisu/tetrisctl's original tetrissh_* names.
+SSH_OBJ   := $(BUILDDIR)/corestack/secure_session.o $(BUILDDIR)/libtetrissh/tetrissh.o
 HTTTP_OBJ := $(BUILDDIR)/libhtttp/htttp.o
 BRAIN_OBJ := $(BUILDDIR)/libtetrisbrain/tetrisbrain.o
 
@@ -47,7 +51,8 @@ COMMON_OBJ  := $(BUILDDIR)/common/rc.o
 DAEMON_OBJ  := $(BUILDDIR)/common/daemon.o
 RING_OBJ    := $(BUILDDIR)/tetrisd/ring.o
 TETRISD_OBJ := $(BUILDDIR)/tetrisd/main.o $(RING_OBJ) \
-               $(BUILDDIR)/tetrisd/clients.o $(BUILDDIR)/tetrisd/rooms.o
+               $(BUILDDIR)/tetrisd/clients.o $(BUILDDIR)/tetrisd/rooms.o \
+               $(BUILDDIR)/tetrisd/admin.o
 
 # --- Binaries ---
 BIN_NAMES := tetrish tetrisd tetrislogd tetrisctl tetrisu tetrish-view
@@ -55,9 +60,13 @@ BINS      := $(addprefix $(BINDIR)/,$(BIN_NAMES))
 
 # --- Test harnesses (built by `make test`) ---
 TEST_BINS := $(BUILDDIR)/tests/test_ring $(BUILDDIR)/tests/stress_ring \
-             $(BUILDDIR)/tests/stub_client
+             $(BUILDDIR)/tests/stub_client $(BUILDDIR)/tests/test_handshake \
+             $(BUILDDIR)/tests/fuzz_malformed $(BUILDDIR)/tests/test_admin \
+             $(BUILDDIR)/tests/fuzz_week12
 TEST_OBJ  := $(BUILDDIR)/tests/test_ring.o $(BUILDDIR)/tests/stress_ring.o \
-             $(BUILDDIR)/tests/stub_client.o
+             $(BUILDDIR)/tests/stub_client.o $(BUILDDIR)/tests/test_handshake.o \
+             $(BUILDDIR)/tests/fuzz_malformed.o $(BUILDDIR)/tests/test_admin.o \
+             $(BUILDDIR)/tests/fuzz_week12.o
 
 # Every object we compile, so we can pull in its generated .d dependency file.
 BIN_OBJ := $(foreach n,$(BIN_NAMES),$(BUILDDIR)/$(n)/main.o)
@@ -140,8 +149,29 @@ $(BUILDDIR)/tests/stress_ring: $(BUILDDIR)/tests/stress_ring.o $(RING_OBJ)
 $(BUILDDIR)/tests/stub_client: $(BUILDDIR)/tests/stub_client.o $(COMMON_OBJ) $(LIB_SSH) $(LIB_HTTTP)
 	$(CC) $(CFLAGS) -o $@ $^ $(SSLLIBS)
 
+# The Week-5 deliverable: socketpair() handshake harness (happy path + the
+# three required failure paths), both ends of the handshake in one process.
+$(BUILDDIR)/tests/test_handshake: $(BUILDDIR)/tests/test_handshake.o $(LIB_SSH)
+	$(CC) $(CFLAGS) -o $@ $^ $(SSLLIBS)
+
+# Week-8 deliverable: fuzz a LIVE tetrisd with malformed input, confirm no crash.
+$(BUILDDIR)/tests/fuzz_malformed: $(BUILDDIR)/tests/fuzz_malformed.o $(COMMON_OBJ) $(LIB_SSH)
+	$(CC) $(CFLAGS) -o $@ $^ $(SSLLIBS)
+
+# Week-9/10 deliverable: admin protocol role gating + concurrent ops consoles.
+$(BUILDDIR)/tests/test_admin: $(BUILDDIR)/tests/test_admin.o $(COMMON_OBJ) $(LIB_SSH) $(LIB_HTTTP)
+	$(CC) $(CFLAGS) -o $@ $^ $(SSLLIBS)
+
+# Week-12 deliverable: broader malformed-HTTTP fuzzing against a live tetrisd.
+$(BUILDDIR)/tests/fuzz_week12: $(BUILDDIR)/tests/fuzz_week12.o $(COMMON_OBJ) $(LIB_SSH)
+	$(CC) $(CFLAGS) -o $@ $^ $(SSLLIBS)
+
 test: $(TEST_BINS)
 	$(BUILDDIR)/tests/test_ring
+	@echo ""
+	@echo "handshake harness built: $(BUILDDIR)/tests/test_handshake"
+	@echo "  run: $(BUILDDIR)/tests/test_handshake"
+	@echo "  under valgrind: valgrind --leak-check=full --show-leak-kinds=all $(BUILDDIR)/tests/test_handshake"
 	@echo ""
 	@echo "stress harness built: $(BUILDDIR)/tests/stress_ring"
 	@echo "  1. start tetrislogd:  bin/tetrislogd <rc-file>"

@@ -1,4 +1,6 @@
 /**
+ * secure_session.c  —  libtetrissh implementation (corestack)
+ *
  * Standardised secure-session library shared by tetriSH (tetrisd/tetrisu)
  * and mini-gh-tracker. See include/corestack/secure_session.h for the
  * protocol description.
@@ -34,7 +36,7 @@
 #include <openssl/x509_vfy.h>
 #include <openssl/err.h>
 #include <openssl/rsa.h>
-#include "secure_session.h"
+#include "corestack/secure_session.h"
 
 /* ─────────────────────────── context / session structs ──────────────────── */
 

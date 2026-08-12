@@ -1,11 +1,4 @@
-Created by following SUTD students:
-
-* 1009016 - Nithilan Srinivasan Poonthamarai
-* 1009320 - Wong Yee Jin
-* 1008976 - Jarrod Low
-
-
-# 2026 SUTD 50.005 CSE C3C8 Corestack: Tetris Battle Royale - tetriSH
+# tetriSH
 
 A secure, from-scratch Tetris server/client pair built around two shared
 libraries: `libtetrissh` (a custom TCP secure-session handshake — nonce,

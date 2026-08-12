@@ -12,13 +12,13 @@
 #define HTTTP_MAX_REASON_LEN 64
 
 typedef enum {
-    HTTTP_OK =  0,               // Success
-    HTTTP_ERR_INCOMPLETE  = -1,  // Buffer ends mid-message, need more data
-    HTTTP_ERR_MALFORMED = -2,    // Parse error: bad grammar
-    HTTTP_ERR_BAD_VERSION = -3,  // Version field is not "HTTTP/1.0"
-    HTTTP_ERR_TOO_LARGE = -4,    // Content-Length exceeds limit
-    HTTTP_ERR_NO_MEMORY = -5,    // malloc failure in serialiser
-    HTTTP_ERR_BAD_HEADER = -6,   // A required header is missing or invalid
+    HTTTP_OK =  0,               /* Success                                  */
+    HTTTP_ERR_INCOMPLETE  = -1,  /* Buffer ends mid-message, need more data  */
+    HTTTP_ERR_MALFORMED = -2,    /* Parse error: bad grammar                 */
+    HTTTP_ERR_BAD_VERSION = -3,  /* Version field is not "HTTTP/1.0"         */
+    HTTTP_ERR_TOO_LARGE = -4,    /* Content-Length exceeds limit             */
+    HTTTP_ERR_NO_MEMORY = -5,    /* malloc failure in serialiser             */
+    HTTTP_ERR_BAD_HEADER = -6,   /* A required header is missing or invalid  */
 } htttp_err_t;
 
 typedef enum {
@@ -29,12 +29,16 @@ typedef enum {
     HTTTP_METHOD_MOVE,
     HTTTP_METHOD_ROTATE,
     HTTTP_METHOD_DROP,
-    HTTTP_METHOD_STATE,          // Server-originated broadcast.
-    HTTTP_METHOD_GET,            // For control-plane polls.
-    HTTTP_METHOD_ADMIN_STATUS,   // GET-like: server + room + player counts.
-    HTTTP_METHOD_ADMIN_ROOMS,    // GET-like: full room list, same shape as ctl's /rooms.
-    HTTTP_METHOD_ADMIN_ATTACH,   // Subscribes this connection to a room's STATE stream, read-only.
-    HTTTP_METHOD_ADMIN_KICK,     // Mutating: removes a player from a room. Full admin only.
+    HTTTP_METHOD_STATE, /* Server-originated broadcast. */
+    HTTTP_METHOD_GET,   /* For control-plane polls.     */
+    /* Week 9/10: the ops-console admin protocol, over the SAME encrypted
+     * libtetrissh session + libhtttp grammar game clients use -- not a
+     * separate channel. See docs/ADMIN_PROTOCOL.md for the full spec
+     * (paths, expected responses, and the role/permission model). */
+    HTTTP_METHOD_ADMIN_STATUS,   /* GET-like: server + room + player counts   */
+    HTTTP_METHOD_ADMIN_ROOMS,    /* GET-like: full room list, same shape as ctl's /rooms */
+    HTTTP_METHOD_ADMIN_ATTACH,   /* Subscribes this connection to a room's STATE stream, read-only */
+    HTTTP_METHOD_ADMIN_KICK,     /* Mutating: removes a player from a room. Full admin only. */
 } htttp_method_t;
 
 typedef enum {
@@ -66,11 +70,11 @@ typedef struct {
     char reason[HTTTP_MAX_REASON_LEN];
     htttp_header_t headers[HTTTP_MAX_HEADERS];
     size_t header_count;
-    const char *body;           // Points into parse buffer. May be NULL
-    size_t body_len;            // 0 if no body
-    const char *player_id;      // Value of Player-Id header or NULL
-    long content_length;        // -1 if absent
-    const char *content_type;   // Value of Content-Type or NULL
+    const char *body;           /* Points into parse buffer. May be NULL */
+    size_t body_len;            /* 0 if no body */
+    const char *player_id;      /* Value of Player-Id header or NULL */
+    long content_length;        /* -1 if absent */
+    const char *content_type;   /* Value of Content-Type or NULL */
 } htttp_msg_t;
 
 typedef struct {

@@ -21,12 +21,18 @@
 #define CLIENT_MAX_FD    4096   // This is the upper bound for the registry array. Any fd at or above this value is refused.
 #define CLIENT_ID_MAX    16
 
+#define CLIENT_ATTACH_ROOM_ID_MAX 32   // Mirrors ROOM_ID_MAX from rooms.h; kept separate to avoid a circular include (rooms.h already includes clients.h).
+
 typedef struct client {
     int fd;                          // A value of -1 means this slot is not being used.
     tetrissh_session_t *sess;        // The secure session for this connection. This struct owns it and must free it.
     char player_id[CLIENT_ID_MAX];   // The player id the server assigned to this client, for example "p7".
     int room;                        // The index of this client's room in the room table. A value of -1 means the client is in the lobby.
     int seat;                        // The seat index for this client inside its room. A value of -1 means no seat has been assigned.
+    long rl_window_start_ms;         // Start of the current rate-limit window (monotonic ms). 0 = not yet started.
+    int  rl_count;                   // Requests seen so far in the current window.
+    int  admin_role;                 // admin_role_t: 0 = not an admin connection, see admin.h.
+    char attach_room_id[CLIENT_ATTACH_ROOM_ID_MAX];// Room id this admin is spectating via ADMIN-ATTACH, or "" if none.
 } client_t;
 
 // Registers a connection that has just finished its handshake. It returns a

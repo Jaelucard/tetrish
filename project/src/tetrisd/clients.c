@@ -27,6 +27,10 @@ client_t *client_add(int fd, tetrissh_session_t *sess){
     c->sess = sess;
     c->room = -1;
     c->seat = -1;
+    c->rl_window_start_ms = 0;
+    c->rl_count = 0;
+    c->admin_role = 0;
+    c->attach_room_id[0] = '\0';
     // This is the identity the server assigns and ties to this connection.
     // The fd is unique among all connections that are currently alive, and
     // that is the only uniqueness guarantee we need here.
