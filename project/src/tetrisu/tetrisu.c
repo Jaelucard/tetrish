@@ -6,6 +6,7 @@
 // was pressed), advances the game by one tick, and redraws. Gravity needs no
 // special handling. The ticks themselves drive it.
 
+#include <locale.h>
 #include <ncurses.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -15,6 +16,7 @@
 
 #include "tetrisbrain.h"
 #include "local.h"
+#include "viz.h"
 
 #define FRAME_MS    16       // ~60 Hz; also the gravity time base
 // The engine's default lock delay (TB_LOCK_DELAY_TICKS = 10) is "500 ms at
@@ -38,6 +40,28 @@ static void on_sigint(int sig)
 {
     (void)sig;
     g_quit = 1;              // handled in the loop; never call endwin() here
+}
+
+// monotonic milliseconds for the visualizer clock; unsigned difference
+// arithmetic keeps elapsed exact across the 32-bit wrap.
+static uint32_t now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)((uint32_t)ts.tv_sec * 1000u + (uint32_t)(ts.tv_nsec / 1000000));
+}
+
+// filled garbage cells on the board right now. the engine marks them
+// with their own cell value, so unlike the networked client this count
+// is exact, and an increase between frames is a garbage injection.
+static int count_garbage(const tb_game *g)
+{
+    int n = 0;
+    for (int y = 1; y <= TB_ROWS; y++)
+        for (int x = 1; x <= TB_COLS; x++)
+            if (g->cells[y][x] == TB_CELL_GARBAGE)
+                n++;
+    return n;
 }
 
 // draws the board's box-drawing border around a TB_COLS x TB_ROWS area.
@@ -95,7 +119,7 @@ static void draw_piece_box(int top, int left, const char *label, int type, bool 
 // redraws the whole screen for one frame: board (with ghost overlay),
 // NEXT/HOLD side boxes, the control list, score footer, and the
 // game-over/paused banner. reads the game, never mutates it.
-static void draw(const tb_game *g, bool paused)
+static void draw(const tb_game *g, bool paused, const viz_t *vz)
 {
     // ask the engine for the merged board, and compute the ghost overlay
     int8_t view[TB_ROWS][TB_COLS];
@@ -138,6 +162,7 @@ static void draw(const tb_game *g, bool paused)
         "z        rotate ccw",
         "a        rotate 180",
         "c        hold",
+        "v        visualizer",
         "r        retry",
         "q / esc  pause",
     };
@@ -150,6 +175,13 @@ static void draw(const tb_game *g, bool paused)
     int footer = BOARD_TOP + TB_ROWS + 2;
     mvprintw(footer,     BOARD_LEFT, "Score: %u  |  Lines: %u  |  Level: %u",
              g->score, g->lines_total, g->level);
+
+    // the visualizer strip, below everything else and only when the
+    // terminal has the rows for it. this frame was erase()d above, so
+    // skipping the draw when toggled off also clears it.
+    if (vz->enabled && vz->running &&
+        footer + 2 + VIZ_STRIP_ROWS <= LINES)
+        viz_draw(vz, footer + 2, COLS);
 
     if (g->game_over) {
         int my = BOARD_TOP + TB_ROWS / 2;
@@ -196,7 +228,9 @@ int tetrisu_local_run(uint32_t seed, uint32_t start_level)
     signal(SIGINT, on_sigint);
 
     // standard ncurses game setup: raw-ish keys, no echo, non-blocking
-    // getch so a frame never waits for input, hidden cursor
+    // getch so a frame never waits for input, hidden cursor. setlocale
+    // first so the visualizer can probe for utf-8 block characters.
+    setlocale(LC_ALL, "");
     initscr();
     cbreak();
     noecho();
@@ -216,6 +250,15 @@ int tetrisu_local_run(uint32_t seed, uint32_t start_level)
     if (start_level > 0)
         tb_set_start_level(&g, start_level);
 
+    // the game is active from here: arm the visualizer. its baseline
+    // animation runs off the monotonic clock only; game events reach it
+    // as accents by diffing the brain's own counters between frames.
+    viz_t vz;
+    viz_init(&vz);
+    viz_begin(&vz, now_ms());
+    uint32_t viz_prev_lines = 0;
+    int      viz_prev_garb  = 0;
+
     // ~60 Hz frame loop; the engine only advances while the game is live
     // and unpaused, but drawing continues so the banners stay up.
     // q (or esc) pauses; from pause or game over, r restarts; shift-q (or
@@ -223,6 +266,14 @@ int tetrisu_local_run(uint32_t seed, uint32_t start_level)
     bool paused = false;
     while (!g_quit) {
         int ch = getch();
+
+        // v toggles the strip and is swallowed here (demoted to "no key")
+        // so the engine still gets its one tick this frame and the key is
+        // never seen as a game input.
+        if (ch == 'v' || ch == 'V') {
+            vz.enabled = !vz.enabled;
+            ch = ERR;
+        }
 
         if (ch == 'Q' || (g.game_over && (ch == 'q' || ch == 27)))
             break;
@@ -232,13 +283,29 @@ int tetrisu_local_run(uint32_t seed, uint32_t start_level)
             if (start_level > 0)
                 tb_set_start_level(&g, start_level);
             paused = false;
+            viz_prev_lines = 0;      // the counters restarted with the game
+            viz_prev_garb  = 0;
         } else if (!g.game_over && (ch == 'q' || ch == 27)) {
             paused = !paused;
         } else if (!g.game_over && !paused) {
             tb_tick(&g, key_to_input(ch));
         }
 
-        draw(&g, paused);
+        // read-only deltas from the brain struct: a lines_total increase
+        // is a clear, a garbage-cell increase is an injection. stepping
+        // is skipped while paused so the strip freezes with the game.
+        if (vz.enabled && !paused) {
+            if (g.lines_total > viz_prev_lines)
+                viz_accent(&vz, VIZ_ACCENT_CLEAR);
+            viz_prev_lines = g.lines_total;
+            int garb = count_garbage(&g);
+            if (garb > viz_prev_garb)
+                viz_accent(&vz, VIZ_ACCENT_GARBAGE);
+            viz_prev_garb = garb;
+            viz_step(&vz, now_ms() - vz.start_ms);
+        }
+
+        draw(&g, paused, &vz);
         napms(FRAME_MS);
     }
 

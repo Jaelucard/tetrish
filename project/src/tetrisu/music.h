@@ -34,6 +34,13 @@ extern const size_t     music_melody_len;
 extern const music_note music_bass[];
 extern const size_t     music_bass_len;
 
+// index of the melody note sounding at elapsed_ms into the looped tune
+// (elapsed_ms wraps modulo one pass, so any monotonic clock can drive
+// it), writing that note's frequency to freq_hz_out (0 for a rest) when
+// non-null. pure integer lookup over the same table playback renders,
+// which is what lets the visualizer run with no audio device at all.
+int music_note_at(uint32_t elapsed_ms, uint16_t *freq_hz_out);
+
 // writes one pass of the tune as a 16-bit mono pcm wav to a fresh
 // mkstemp file. returns 0 and copies the path into path_out on success,
 // -1 on any failure (nothing is left behind on failure).

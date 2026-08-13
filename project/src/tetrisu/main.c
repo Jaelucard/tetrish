@@ -53,9 +53,11 @@
 // SO_RCVTIMEO and SO_SNDTIMEO bound that wait instead, which is the same
 // mechanism the server uses on its side of the same library.
 
+#include <locale.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
@@ -67,6 +69,7 @@
 #include "local.h"
 #include "music.h"
 #include "net.h"
+#include "viz.h"
 
 #define VIEW_ROWS   NET_VIEW_ROWS
 #define VIEW_COLS   NET_VIEW_COLS
@@ -85,6 +88,16 @@
 static net_ctx  g_net;
 static int      g_curses_up = 0;
 static music_t  g_music;         // zeroed static: music_stop is safe before music_start
+static viz_t    g_viz;           // the visualizer strip's whole state
+
+// monotonic milliseconds for the visualizer's animation clock. wrapping
+// at 32 bits is fine: elapsed is always computed as a difference, and
+// unsigned subtraction is exact across the wrap.
+static uint32_t now_ms(void){
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)((uint32_t)ts.tv_sec * 1000u + (uint32_t)(ts.tv_nsec / 1000000));
+}
 
 // Registered with atexit BEFORE curses starts, so every exit path restores the
 // terminal, including ones that have not been written yet. jserv's tetris does
@@ -171,7 +184,8 @@ static void draw_board(const board_t *b, int top, int left, int is_me){
 // carried (side by side, as many as fit the terminal), and the key help
 // footer. everything drawn here comes from net_ctx -- this client holds no
 // game state of its own.
-static void draw_all(const net_ctx *net, const char *room, int connected){
+static void draw_all(const net_ctx *net, const char *room, int connected,
+                     const viz_t *viz){
     erase();
 
     // Lay out from the bottom of the mandatory block upwards, so the board
@@ -194,7 +208,14 @@ static void draw_all(const net_ctx *net, const char *room, int connected){
     int f = board_top + VIEW_ROWS + 3;
     if (f < LINES)
         mvprintw(f, BOARD_LEFT,
-                 "left/right move - down soft - space hard - up/x rot - z ccw - m music - q quit");
+                 "arrows move - down soft - space hard - x/z rot - m music - v viz - q quit");
+
+    // The visualizer strip sits under everything mandatory and is drawn
+    // only when the terminal actually has the rows for it, the same
+    // opt-in rule as the name row above the boards. Same erase()d frame,
+    // so toggling it off needs no explicit clearing.
+    if (viz->enabled && viz->running && f + 1 + VIZ_STRIP_ROWS <= LINES)
+        viz_draw(viz, f + 1, COLS);
 
     // One doupdate per frame rather than a refresh per element, so the screen
     // updates atomically and never tears between boards.
@@ -306,6 +327,9 @@ int main(int argc, char **argv){
     if (st != 200 && st != 409) die("START refused by the server", "");
 
     // Curses comes up only now, so every failure above prints normally.
+    // setlocale first: it decides whether the terminal's byte encoding is
+    // utf-8, which the visualizer probes for its partial-block ramp.
+    setlocale(LC_ALL, "");
     atexit(restore_terminal);
     initscr();
     g_curses_up = 1;
@@ -324,6 +348,16 @@ int main(int argc, char **argv){
                  ROWS_REQUIRED, VIEW_COLS * CELL_W + 6, LINES, COLS);
         die("terminal too small: needs %s", need);
     }
+
+    // The game is active from here: arm the visualizer's animation clock.
+    // The baseline animation runs off this local monotonic clock ONLY;
+    // STATE arrivals influence it exclusively through the accent hooks
+    // below, so network jitter can never make the bars stutter.
+    viz_init(&g_viz);
+    viz_begin(&g_viz, now_ms());
+    long     viz_prev_states = 0;
+    unsigned viz_prev_lines  = 0;
+    int      viz_prev_filled = -1;   // -1: no baseline frame yet
 
     int running = 1, connected = 1;
     while (running){
@@ -387,6 +421,10 @@ int main(int argc, char **argv){
                 // m is handled entirely client-side: body stays NULL, so the
                 // keypress is never forwarded to the server as a game input.
                 case 'm': case 'M': music_toggle(&g_music); break;
+                // v is client-side like m: body stays NULL, so the key is
+                // never forwarded as a game input. draw_all erases every
+                // frame, so toggling off clears the strip on its own.
+                case 'v': case 'V': g_viz.enabled = !g_viz.enabled; break;
                 case 'q': case 'Q': running = 0; break;
                 default: break;                       // ERR and unknown keys
                 }
@@ -403,7 +441,38 @@ int main(int argc, char **argv){
             if (net_poll_state(&g_net) < 0) connected = 0;
         }
 
-        draw_all(&g_net, room, connected);
+        // Server events reach the visualizer as accents only, detected by
+        // diffing our own board across STATE frames (the states counter
+        // says whether one arrived since the last frame). lines going up
+        // is a clear. For garbage the wire is ambiguous -- TB_CELL_GARBAGE
+        // serializes as '6', the same digit as an L piece (render_board's
+        // "% 10"; see REQUIRED_FILES.md) -- so it is inferred instead: a
+        // lock adds at most 4 filled cells net, while an injection adds 9
+        // per row in one frame, so a jump of more than 4 without a line
+        // clear can only be garbage.
+        if (g_viz.enabled && g_net.states != viz_prev_states){
+            viz_prev_states = g_net.states;
+            for (int i = 0; i < g_net.nboards; i++){
+                const board_t *me = &g_net.boards[i];
+                if (strcmp(me->id, g_net.player_id) != 0) continue;
+                int filled = 0;
+                for (int y = 0; y < me->rows_filled; y++)
+                    for (int x = 0; x < VIEW_COLS; x++)
+                        if (me->cells[y][x] != '.' && me->cells[y][x] != '\0')
+                            filled++;
+                if (me->lines > viz_prev_lines)
+                    viz_accent(&g_viz, VIZ_ACCENT_CLEAR);
+                else if (viz_prev_filled >= 0 && filled - viz_prev_filled > 4)
+                    viz_accent(&g_viz, VIZ_ACCENT_GARBAGE);
+                viz_prev_lines  = me->lines;
+                viz_prev_filled = filled;
+                break;
+            }
+        }
+        if (g_viz.enabled)
+            viz_step(&g_viz, now_ms() - g_viz.start_ms);
+
+        draw_all(&g_net, room, connected, &g_viz);
     }
 
     music_stop(&g_music);

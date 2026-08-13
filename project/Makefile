@@ -72,7 +72,8 @@ TETRISD_OBJ := $(BUILDDIR)/tetrisd/main.o $(RING_OBJ) \
 # editing a header it includes would NOT rebuild it -- an incremental make
 # would silently link stale code.
 TETRISU_OBJ := $(BUILDDIR)/tetrisu/main.o $(BUILDDIR)/tetrisu/net.o \
-               $(BUILDDIR)/tetrisu/tetrisu.o $(BUILDDIR)/tetrisu/music.o
+               $(BUILDDIR)/tetrisu/tetrisu.o $(BUILDDIR)/tetrisu/music.o \
+               $(BUILDDIR)/tetrisu/viz.o
 VIEW_OBJ    := $(BUILDDIR)/tetrish-view/main.o $(BUILDDIR)/tetrish-view/control.o \
                $(BUILDDIR)/tetrish-view/repl.o $(BUILDDIR)/tetrish-view/dispatch.o \
                $(BUILDDIR)/tetrish-view/jsonish.o $(BUILDDIR)/tetrish-view/edit.o \
@@ -107,7 +108,7 @@ TEST_OBJ  := $(BUILDDIR)/tests/test_ring.o $(BUILDDIR)/tests/stress_ring.o \
 # test) is simply empty.
 SANFLAGS      := -fsanitize=address,undefined -fno-omit-frame-pointer
 SAN_TEST_SRCS := $(wildcard tests/test_brain*.c) $(wildcard tests/test_view*.c) \
-                 $(wildcard tests/test_music*.c)
+                 $(wildcard tests/test_music*.c) $(wildcard tests/test_viz*.c)
 SAN_TEST_BINS := $(patsubst tests/%.c,$(BUILDDIR)/tests-san/%,$(SAN_TEST_SRCS))
 
 SAN_EXTRA_SRC_test_brain := src/libtetrisbrain/tetrisbrain.c
@@ -123,6 +124,12 @@ SAN_EXTRA_SRC_test_view_edit := src/tetrish-view/edit.c
 # music.c is pure synthesis plus posix process calls, no curses and no
 # libhtttp/libtetrissh dependency, so it fits the sanitized tier too.
 SAN_EXTRA_SRC_test_music := src/tetrisu/music.c
+# the visualizer test exercises only viz.c's pure core plus music.c's
+# note lookup, but viz.c also contains viz_draw, whose curses calls must
+# resolve at link time even though the test never calls it -- hence the
+# SAN_EXTRA_LIBS hook below rather than a curses dependency in the test.
+SAN_EXTRA_SRC_test_viz := src/tetrisu/viz.c src/tetrisu/music.c
+SAN_EXTRA_LIBS_test_viz := -lncurses
 
 # Every object we compile, so we can pull in its generated .d dependency file.
 BIN_OBJ := $(foreach n,$(BIN_NAMES),$(BUILDDIR)/$(n)/main.o)
@@ -257,10 +264,12 @@ $(BUILDDIR)/tests/test_control: tests/test_control.c tests/mocks/mock_control.c 
 # source was compiled in by the recipe but never tracked as a dependency,
 # and editing it left a stale test binary. The doubled $$ defers expansion
 # to the second pass, where $* exists.
+# SAN_EXTRA_LIBS_<stem>, looked up like SAN_EXTRA_SRC_<stem>: link-time
+# libraries a companion source drags in (undefined otherwise, i.e. empty).
 .SECONDEXPANSION:
 $(BUILDDIR)/tests-san/%: tests/%.c $$(SAN_EXTRA_SRC_$$*)
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) $(SANFLAGS) -o $@ $< $(SAN_EXTRA_SRC_$*)
+	$(CC) $(CFLAGS) $(SANFLAGS) -o $@ $< $(SAN_EXTRA_SRC_$*) $(SAN_EXTRA_LIBS_$*)
 
 # Sanitized owned tests only, independent of libtetrissh/libhtttp -- this is
 # what tests/smoke.sh runs, so it can verify the owned tree even when a

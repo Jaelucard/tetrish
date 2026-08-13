@@ -251,3 +251,48 @@ Music lives client-side only: the server is authoritative over the game,
 but sound is presentation, exactly like colors and box-drawing -- the
 brain and the wire protocol know nothing about it, which is also what
 keeps the 20k-tick determinism contract untouched.
+
+## Music visualizer (tetrisu)
+
+The `v`-toggled bar strip under the boards renders the *score*, not
+captured audio. The music is synthesized square waves from a note table
+this repo owns (`music_melody` in `src/tetrisu/music.c`), so "what is
+playing at millisecond t" is not something to measure -- it is something
+to look up. `music_note_at` does exactly that: prefix sums over the note
+durations, `elapsed % total` for the loop, binary search for the note.
+For a synthesized square wave that lookup is equivalent to what an FFT
+of the output would show (one dominant fundamental per voice), and it
+buys three things a capture pipeline cannot: it works with no audio
+device at all (Docker, devcontainer, CI -- the environments this project
+actually runs in), it needs no FFT or capture dependency, and the whole
+core is deterministic, so `tests/test_viz.c` drives it with synthetic
+millisecond values and asserts exact bar states.
+
+The baseline animation is clocked off CLOCK_MONOTONIC only -- never off
+STATE arrivals, so network jitter cannot make the bars stutter. The
+server influences the strip exclusively through game-event accents,
+detected by diffing already-tracked state between frames: our board's
+`lines` counter rising fires the CLEAR accent (all bars spike); garbage
+appearing fires the GARBAGE accent (alternating bars spike plus a
+short-lived hostile red tint). In `--local` the same deltas come from
+the brain struct directly, where garbage cells are exact
+(`TB_CELL_GARBAGE`); on the wire garbage serializes as the digit '6'
+(render_board's `% 10` aliases it with an L piece -- recorded in
+REQUIRED_FILES.md), so the networked client infers it instead: a filled-
+cell jump of more than 4 in one STATE without a line clear can only be
+an injection, because a lock adds at most 4 cells net and a garbage row
+adds 9.
+
+Bar heights are integers in eighths of a row. On a UTF-8 locale
+(`nl_langinfo(CODESET)` after `setlocale(LC_ALL, "")`, checked at
+runtime) the strip renders at that resolution with the U+2581..U+2588
+partial-block ramp; otherwise it falls back to full-cell reverse-video
+spaces with a dim cell for the half step, the same no-colour idiom the
+board renderer already uses. Colour reuses main.c's existing init_pair
+table (5 green, 4 yellow, 7 red) as a bottom-to-top gradient, all red
+while the hostile tint is live, and degrades to monochrome when no pair
+table is initialised (the `--local` client never calls start_color).
+The strip draws only when LINES leaves room after every existing UI
+element, piggybacks on the existing frame pacers (no descriptors, no
+sleeps, no threads), and none of it touches the brain or the wire
+protocol, so the determinism contract is untouched.

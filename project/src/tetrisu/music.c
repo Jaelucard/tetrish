@@ -104,6 +104,45 @@ const music_note music_bass[] = {
 };
 const size_t music_bass_len = sizeof music_bass / sizeof music_bass[0];
 
+// prefix sums of the melody durations, built once on first use:
+// note_prefix[i] is the ms offset where note i starts and
+// note_prefix[len] is the length of one whole pass. the build is
+// idempotent integer arithmetic over a const table, so the lazy init
+// stays deterministic no matter who calls first.
+static uint32_t note_prefix[sizeof music_melody / sizeof music_melody[0] + 1];
+static int note_prefix_built = 0;
+
+static void build_note_prefix(void)
+{
+    uint32_t acc = 0;
+    for (size_t i = 0; i < music_melody_len; i++) {
+        note_prefix[i] = acc;
+        acc += music_melody[i].dur_ms;
+    }
+    note_prefix[music_melody_len] = acc;
+    note_prefix_built = 1;
+}
+
+// which melody note sounds at elapsed_ms into the loop: modulo one pass,
+// then binary search for the last note starting at or before that point.
+int music_note_at(uint32_t elapsed_ms, uint16_t *freq_hz_out)
+{
+    if (!note_prefix_built)
+        build_note_prefix();
+    uint32_t t = elapsed_ms % note_prefix[music_melody_len];
+    size_t lo = 0, hi = music_melody_len - 1;
+    while (lo < hi) {
+        size_t mid = (lo + hi + 1) / 2;
+        if (note_prefix[mid] <= t)
+            lo = mid;
+        else
+            hi = mid - 1;
+    }
+    if (freq_hz_out != NULL)
+        *freq_hz_out = music_melody[lo].freq_hz;
+    return (int)lo;
+}
+
 // pcm samples a duration in ms occupies (all table durations are
 // multiples of 200 ms, so this divides exactly at 22050 hz)
 static uint32_t ms_samples(uint32_t ms)

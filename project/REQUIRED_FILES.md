@@ -98,3 +98,13 @@ noted, and continues on the next unblocked item.
       send, and today gets back tetrisd's real 404 `{"error": "unknown
       control path"}` (confirmed live against a running `tetrisd`, and
       covered by `tests/test_control.c`'s kick-path mock).
+
+- [ ] distinct STATE cell marker for garbage rows — needed for tetrisu's
+      visualizer GARBAGE accent to be exact rather than inferred — expected
+      interface: `render_board` (`src/tetrisd/main.c`) emitting a dedicated
+      character (e.g. '8', matching the log format's `board_hex` choice) for
+      `TB_CELL_GARBAGE` cells instead of the current `'0' + (126 % 10)` =
+      '6', which aliases garbage with L-piece cells on the wire. Until then
+      the client infers injections from a filled-cell jump > 4 in one STATE
+      frame without a line clear (a lock adds at most 4 cells net, a garbage
+      row adds 9).
