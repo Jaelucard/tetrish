@@ -18,7 +18,7 @@ static const uint16_t TSPIN_POINTS_DEFAULT[4] = {400, 800, 1200, 1600};
 
 // A mini pays roughly a quarter of a full spin. The table stops at a double
 // because a mini is by definition a spin into a shallow slot, and no board
-// shape lets one clear three rows.
+// shape lets one clear three rows. simply put: its a t spin with only one corner occupied.
 static const uint16_t TSPIN_MINI_POINTS_DEFAULT[3] = {100, 200, 400};
 
 #define TB_COMBO_POINTS_DEFAULT          50u
@@ -29,30 +29,37 @@ static const uint16_t TSPIN_MINI_POINTS_DEFAULT[3] = {100, 200, 400};
 // shape table (used tetrio for reference)
 
 const tb_position tb_positions[TB_NUM_PIECES][TB_NUM_ORIENTATIONS] = {
+    //square block
     [TB_O] = {
         {{{1,1},{2,1},{1,2},{2,2}}}, {{{1,1},{2,1},{1,2},{2,2}}},
         {{{1,1},{2,1},{1,2},{2,2}}}, {{{1,1},{2,1},{1,2},{2,2}}},
     },
+    // straight block
     [TB_I] = {
         {{{0,1},{1,1},{2,1},{3,1}}}, {{{2,0},{2,1},{2,2},{2,3}}},
         {{{0,1},{1,1},{2,1},{3,1}}}, {{{2,0},{2,1},{2,2},{2,3}}},
     },
+    // T block
     [TB_T] = {
         {{{2,0},{1,1},{2,1},{3,1}}}, {{{2,0},{2,1},{2,2},{3,1}}},
         {{{2,2},{1,1},{2,1},{3,1}}}, {{{2,0},{2,1},{2,2},{1,1}}},
     },
+    // S block
     [TB_S] = {
         {{{2,0},{1,1},{2,1},{1,2}}}, {{{1,1},{2,1},{2,2},{3,2}}},
         {{{2,0},{1,1},{2,1},{1,2}}}, {{{1,1},{2,1},{2,2},{3,2}}},
     },
+    // Z block
     [TB_Z] = {
         {{{1,0},{1,1},{2,1},{2,2}}}, {{{1,1},{2,1},{0,2},{1,2}}},
         {{{1,0},{1,1},{2,1},{2,2}}}, {{{1,1},{2,1},{0,2},{1,2}}},
     },
+    // J block
     [TB_J] = {
         {{{1,0},{1,1},{1,2},{2,2}}}, {{{1,1},{2,1},{3,1},{1,2}}},
         {{{1,0},{2,0},{2,1},{2,2}}}, {{{2,0},{0,1},{1,1},{2,1}}},
     },
+    // L block
     [TB_L] = {
         {{{2,0},{2,1},{2,2},{1,2}}}, {{{1,0},{1,1},{2,1},{3,1}}},
         {{{1,0},{2,0},{1,1},{1,2}}}, {{{0,1},{1,1},{2,1},{2,2}}},
@@ -69,7 +76,7 @@ static const tb_point SPAWN_ORIGIN = {3, 0};
 // the same seed bit-identical.
 static uint32_t tb_rand(tb_game *g)
 {
-    uint32_t x = g->rng_state;        // xorshift32; never zero (see tb_init)
+    uint32_t x = g->rng_state;        // xorshift32; never zero (see tb_init), idea spawned from a github repo.
     x ^= x << 13; x ^= x >> 17; x ^= x << 5;
     return g->rng_state = x;
 }
