@@ -57,7 +57,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
@@ -67,9 +66,7 @@
 #include "rc.h"
 #include "htttp.h"
 #include "local.h"
-#include "music.h"
 #include "net.h"
-#include "viz.h"
 
 #define VIEW_ROWS   NET_VIEW_ROWS
 #define VIEW_COLS   NET_VIEW_COLS
@@ -87,17 +84,6 @@
 
 static net_ctx  g_net;
 static int      g_curses_up = 0;
-static music_t  g_music;         // zeroed static: music_stop is safe before music_start
-static viz_t    g_viz;           // the visualizer strip's whole state
-
-// monotonic milliseconds for the visualizer's animation clock. wrapping
-// at 32 bits is fine: elapsed is always computed as a difference, and
-// unsigned subtraction is exact across the wrap.
-static uint32_t now_ms(void){
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint32_t)((uint32_t)ts.tv_sec * 1000u + (uint32_t)(ts.tv_nsec / 1000000));
-}
 
 // Registered with atexit BEFORE curses starts, so every exit path restores the
 // terminal, including ones that have not been written yet. jserv's tetris does
@@ -109,10 +95,7 @@ static void restore_terminal(void){
 
 // Fail with the terminal already restored, so the message is readable and the
 // shell survives. Never call exit() directly once curses owns the screen.
-// Also the one funnel every fatal path passes through, so stopping the music
-// child here covers handshake/JOIN/START failures after music has started.
 static void die(const char *fmt, const char *arg){
-    music_stop(&g_music);
     restore_terminal();
     fprintf(stderr, "tetrisu: ");
     fprintf(stderr, fmt, arg);
@@ -184,8 +167,7 @@ static void draw_board(const board_t *b, int top, int left, int is_me){
 // carried (side by side, as many as fit the terminal), and the key help
 // footer. everything drawn here comes from net_ctx -- this client holds no
 // game state of its own.
-static void draw_all(const net_ctx *net, const char *room, int connected,
-                     const viz_t *viz){
+static void draw_all(const net_ctx *net, const char *room, int connected){
     erase();
 
     // Lay out from the bottom of the mandatory block upwards, so the board
@@ -208,14 +190,7 @@ static void draw_all(const net_ctx *net, const char *room, int connected,
     int f = board_top + VIEW_ROWS + 3;
     if (f < LINES)
         mvprintw(f, BOARD_LEFT,
-                 "arrows move - down soft - space hard - x/z rot - m music - v viz - q quit");
-
-    // The visualizer strip sits under everything mandatory and is drawn
-    // only when the terminal actually has the rows for it, the same
-    // opt-in rule as the name row above the boards. Same erase()d frame,
-    // so toggling it off needs no explicit clearing.
-    if (viz->enabled && viz->running && f + 1 + VIZ_STRIP_ROWS <= LINES)
-        viz_draw(viz, f + 1, COLS);
+                 "arrows move - down soft - space hard - x/z rot - q quit");
 
     // One doupdate per frame rather than a refresh per element, so the screen
     // updates atomically and never tears between boards.
@@ -273,21 +248,14 @@ int main(int argc, char **argv){
         die("failed to load configuration from %s", rc_path);
 
     // Block SIGINT and take it as a readable descriptor instead. This has to
-    // happen before anything else can be interrupted. SIGCHLD rides the same
-    // signalfd: it is blocked BEFORE the music child is forked, so its exit
-    // can never be missed, only parked until the loop reads the descriptor.
+    // happen before anything else can be interrupted.
     sigset_t mask;
     sigemptyset(&mask);
     sigaddset(&mask, SIGINT);
     sigaddset(&mask, SIGTERM);
-    sigaddset(&mask, SIGCHLD);
     if (sigprocmask(SIG_BLOCK, &mask, NULL) < 0) die("sigprocmask: %s", strerror(errno));
     int sigfd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
     if (sigfd < 0) die("signalfd: %s", strerror(errno));
-
-    // Background music, strictly off the critical path: any failure prints
-    // one line (curses is not up yet) and the game continues in silence.
-    music_start(&g_music);
 
     if (net_connect_and_handshake(&cfg, &g_net) != 0){
         // Copy the reason out BEFORE net_close: tetrissh_strerror returns a
@@ -327,8 +295,6 @@ int main(int argc, char **argv){
     if (st != 200 && st != 409) die("START refused by the server", "");
 
     // Curses comes up only now, so every failure above prints normally.
-    // setlocale first: it decides whether the terminal's byte encoding is
-    // utf-8, which the visualizer probes for its partial-block ramp.
     setlocale(LC_ALL, "");
     atexit(restore_terminal);
     initscr();
@@ -348,16 +314,6 @@ int main(int argc, char **argv){
                  ROWS_REQUIRED, VIEW_COLS * CELL_W + 6, LINES, COLS);
         die("terminal too small: needs %s", need);
     }
-
-    // The game is active from here: arm the visualizer's animation clock.
-    // The baseline animation runs off this local monotonic clock ONLY;
-    // STATE arrivals influence it exclusively through the accent hooks
-    // below, so network jitter can never make the bars stutter.
-    viz_init(&g_viz);
-    viz_begin(&g_viz, now_ms());
-    long     viz_prev_states = 0;
-    unsigned viz_prev_lines  = 0;
-    int      viz_prev_filled = -1;   // -1: no baseline frame yet
 
     int running = 1, connected = 1;
     while (running){
@@ -385,15 +341,12 @@ int main(int argc, char **argv){
 
         // Independent ifs, never else-if. At 20 Hz the socket is ready on
         // almost every frame, and an else-if chain would starve the keyboard.
-        // Drained in a loop (the fd is non-blocking): SIGCHLD means the music
-        // player finished a pass and gets respawned so the tune repeats;
-        // anything else on this descriptor is a request to quit.
+        // Drained in a loop (the fd is non-blocking): anything on this
+        // descriptor is a request to quit.
         if (FD_ISSET(sigfd, &rfds)){
             struct signalfd_siginfo si;
-            while (read(sigfd, &si, sizeof si) == (ssize_t)sizeof si){
-                if (si.ssi_signo == SIGCHLD) music_on_sigchld(&g_music);
-                else                         running = 0;
-            }
+            while (read(sigfd, &si, sizeof si) == (ssize_t)sizeof si)
+                running = 0;
         }
 
         if (FD_ISSET(STDIN_FILENO, &rfds)){
@@ -418,13 +371,6 @@ int main(int argc, char **argv){
                 // No 180/hold/pause here: the wire protocol carries only
                 // MOVE/ROTATE/DROP, and a server-authoritative multiplayer
                 // room cannot pause for one player. Local mode has them all.
-                // m is handled entirely client-side: body stays NULL, so the
-                // keypress is never forwarded to the server as a game input.
-                case 'm': case 'M': music_toggle(&g_music); break;
-                // v is client-side like m: body stays NULL, so the key is
-                // never forwarded as a game input. draw_all erases every
-                // frame, so toggling off clears the strip on its own.
-                case 'v': case 'V': g_viz.enabled = !g_viz.enabled; break;
                 case 'q': case 'Q': running = 0; break;
                 default: break;                       // ERR and unknown keys
                 }
@@ -441,41 +387,9 @@ int main(int argc, char **argv){
             if (net_poll_state(&g_net) < 0) connected = 0;
         }
 
-        // Server events reach the visualizer as accents only, detected by
-        // diffing our own board across STATE frames (the states counter
-        // says whether one arrived since the last frame). lines going up
-        // is a clear. For garbage the wire is ambiguous -- TB_CELL_GARBAGE
-        // serializes as '6', the same digit as an L piece (render_board's
-        // "% 10"; see REQUIRED_FILES.md) -- so it is inferred instead: a
-        // lock adds at most 4 filled cells net, while an injection adds 9
-        // per row in one frame, so a jump of more than 4 without a line
-        // clear can only be garbage.
-        if (g_viz.enabled && g_net.states != viz_prev_states){
-            viz_prev_states = g_net.states;
-            for (int i = 0; i < g_net.nboards; i++){
-                const board_t *me = &g_net.boards[i];
-                if (strcmp(me->id, g_net.player_id) != 0) continue;
-                int filled = 0;
-                for (int y = 0; y < me->rows_filled; y++)
-                    for (int x = 0; x < VIEW_COLS; x++)
-                        if (me->cells[y][x] != '.' && me->cells[y][x] != '\0')
-                            filled++;
-                if (me->lines > viz_prev_lines)
-                    viz_accent(&g_viz, VIZ_ACCENT_CLEAR);
-                else if (viz_prev_filled >= 0 && filled - viz_prev_filled > 4)
-                    viz_accent(&g_viz, VIZ_ACCENT_GARBAGE);
-                viz_prev_lines  = me->lines;
-                viz_prev_filled = filled;
-                break;
-            }
-        }
-        if (g_viz.enabled)
-            viz_step(&g_viz, now_ms() - g_viz.start_ms);
-
-        draw_all(&g_net, room, connected, &g_viz);
+        draw_all(&g_net, room, connected);
     }
 
-    music_stop(&g_music);
     if (connected)
         net_send_action(&g_net, HTTTP_METHOD_LEAVE, path, NULL);
     net_close(&g_net);
