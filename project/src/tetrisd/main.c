@@ -214,19 +214,24 @@ static void slog(const char *level, const char *fmt, ...){
 // the third.
 //
 //   E <mono_ns> <tick> <room> <player> <action> [params...]
-//   S <mono_ns> <tick> <room> <player> <w> <h> <cells_hex>
+//   S <mono_ns> <tick> <room> <player> <w> <h> <cells_hex> <seed>
 //
-// The tick number is the important addition to the record format, and it is
-// what makes replay exact rather than approximate.
+// The tick number is what makes replay exact rather than approximate.
 // libtetrisbrain advances gravity per tick and has no clock of its own, so a
-// reader that only had timestamps would have to guess how many ticks elapsed
-// between two events. With the tick recorded, replay is: seed the engine, then
-// for tick 0..N apply whatever input that tick carried and call tb_tick once.
-// Without it, replay could only approximate where gravity had got to.
+// reader with only timestamps would have to guess how many ticks passed between
+// two events. With the tick recorded, replay is: seed the engine, then for tick
+// 0..N apply whatever input that tick carried and call tb_tick once.
 //
 // The actions that replay actually needs are SEED, INPUT and GARBAGE. CLEAR and
 // OVER are derivable from replaying those, and are emitted anyway so a reader
 // can verify its own reconstruction against what the server recorded.
+//
+// The S record re-states the seat's seed as its last field. The SEED record is
+// written exactly once, at START, and a hundred rooms starting together emit
+// hundreds of records into a datagram queue that holds about ten, so the burst
+// that creates SEED records is the burst that drops them. Re-stating the seed
+// on every snapshot means any single surviving snapshot is enough to seed a
+// replay; the log stops having one indispensable line per session.
 static void rlog(const char *fmt, ...){
     char buf[RING_REC_MAX];
     va_list ap;
@@ -573,7 +578,11 @@ static int do_join(client_t *c, const char *rid){
         uint32_t seed = (uint32_t)getpid() * 2654435761u + 0x9E3779B9u
                       + ++late_seed_counter;
         tb_init(&r->games[c->seat], seed);
-        tb_set_lock_delay(&r->games[c->seat], (uint32_t)(g_cfg.tick_hz / 2));
+        r->seeds[c->seat] = seed;        // snapshots re-state this; see rooms.h
+        // This room's rate, not the live config's: see the note in rooms.h.
+        // A reload between START and this join would otherwise hand the late
+        // arrival a lock delay that does not match the ticker they are joining.
+        tb_set_lock_delay(&r->games[c->seat], (uint32_t)(r->tick_hz / 2));
         r->pending[c->seat] = TB_INPUT_NONE;
         uint64_t at_tick = r->ticks;
         pthread_mutex_unlock(&r->mu);
@@ -623,17 +632,28 @@ static int do_start(client_t *c, const char *rid){
     // random seed. We write the seed to the log on purpose, because the replay
     // feature later on needs the seed together with the inputs to rebuild the
     // exact same game.
+    // The rate this room will actually tick at, resolved once, here, and then
+    // stored on the room. Everything downstream (the lock delay below, the
+    // timerfd period, a late joiner's lock delay in do_join) reads it from the
+    // room rather than from g_cfg, so a SIGHUP reload cannot leave a running
+    // room's seats disagreeing with its ticker. This is also the single place a
+    // nonsensical configured value is corrected, which keeps a negative tick_hz
+    // from reaching the unsigned conversion in tb_set_lock_delay.
+    int hz = (g_cfg.tick_hz > 0) ? g_cfg.tick_hz : 20;
+
     static uint32_t seed_counter = 0;
     pthread_mutex_lock(&r->mu);
+    r->tick_hz = hz;
     for (int i = 0; i < ROOM_MAX_PLAYERS; i++){
         if (r->players[i] == NULL) continue;
         uint32_t seed = (uint32_t)getpid() * 2654435761u + ++seed_counter;
         tb_init(&r->games[i], seed);
+        r->seeds[i] = seed;              // snapshots re-state this; see rooms.h
         // The engine counts lock delay in ticks and has no clock of its own, so
-        // the wall-clock figure has to be converted here, where tick_hz is
-        // known. Half a second at the configured rate, which is 10 ticks at the
+        // the wall-clock figure has to be converted here, where the rate is
+        // known. Half a second at this room's rate, which is 10 ticks at the
         // default tick_hz of 20.
-        tb_set_lock_delay(&r->games[i], (uint32_t)(g_cfg.tick_hz / 2));
+        tb_set_lock_delay(&r->games[i], (uint32_t)(hz / 2));
         r->pending[i] = TB_INPUT_NONE;
         slog("info", "room %s: SEED seat=%d player=%s seed=%u",
              r->id, i, r->players[i]->player_id, seed);
@@ -657,7 +677,7 @@ static int do_start(client_t *c, const char *rid){
         r->started = 0;
         return send_response(c, HTTTP_500_INTERNAL_ERROR, "{\"error\": \"timer\"}", NULL);
     }
-    long period_ns = 1000000000L / (g_cfg.tick_hz > 0 ? g_cfg.tick_hz : 20);
+    long period_ns = 1000000000L / hz;
     struct itimerspec its;
     memset(&its, 0, sizeof its);
     its.it_interval.tv_sec  = period_ns / 1000000000L;
@@ -668,7 +688,7 @@ static int do_start(client_t *c, const char *rid){
     ep_add(g_ep, tfd);
 
     slog("info", "room %s: STARTED by %s (%d players, %d Hz)",
-         r->id, c->player_id, r->nplayers, g_cfg.tick_hz);
+         r->id, c->player_id, r->nplayers, hz);
     return send_response(c, HTTTP_200_OK, "{\"ok\": true}", NULL);
 }
 
@@ -1088,17 +1108,28 @@ static void handle_room_tick(room_t *r){
                  (unsigned long long)r->ticks, r->id,
                  r->players[i]->player_id);
 
-        // A periodic full board. Snapshots are what make replay survive a
-        // dropped record: without them a single lost INPUT would desync every
-        // tick that followed, forever. With them, a reader can resynchronise at
-        // the next snapshot, and can also seek without replaying from tick 0.
+        // A periodic full board, plus the seat's seed. The board is what lets
+        // a reader detect (and resync from) a reconstruction that diverged
+        // because a record was dropped; the seed is re-stated here so that
+        // replay does not hinge on the one write-once SEED record surviving
+        // the START burst. See the format comment above rlog.
+        //
+        // The phase is staggered by room. Rooms started in the same second all
+        // reach ticks % interval == 0 within a few milliseconds of each other,
+        // so an unstaggered schedule fires every room's snapshots as one burst
+        // into a datagram queue holding about ten. The drain order is stable
+        // too, so the SAME seats lose their snapshots every interval, some of
+        // them losing all ten. Offsetting each room by its table index turns
+        // the burst into a trickle at no change in per-seat rate.
         if (g_cfg.snapshot_interval > 0 &&
-            r->ticks % (uint64_t)g_cfg.snapshot_interval == 0){
+            r->ticks % (uint64_t)g_cfg.snapshot_interval ==
+                (uint64_t)(room_index(r) % g_cfg.snapshot_interval)){
             char hex[TB_ROWS * TB_COLS + 1];
             board_hex(&r->games[i], hex, sizeof hex);
-            rlog("S %llu %llu %s %s %d %d %s", mono_ns(),
+            rlog("S %llu %llu %s %s %d %d %s %u", mono_ns(),
                  (unsigned long long)r->ticks, r->id,
-                 r->players[i]->player_id, TB_COLS, TB_ROWS, hex);
+                 r->players[i]->player_id, TB_COLS, TB_ROWS, hex,
+                 r->seeds[i]);
         }
 
         r->pending[i] = TB_INPUT_NONE;
