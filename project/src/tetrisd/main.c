@@ -255,7 +255,12 @@ static atomic_ulong dropped_send;
 static atomic_int   shipper_stop;
 
 static void log_init(const char *path){
-    log_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    // O_NONBLOCK via fcntl rather than Linux's SOCK_NONBLOCK type flag, so
+    // this builds on macOS too. There is no atomicity concern: no thread
+    // touches this fd until after log_init returns.
+    log_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (log_fd >= 0)
+        fcntl(log_fd, F_SETFL, fcntl(log_fd, F_GETFL, 0) | O_NONBLOCK);
     memset(&log_addr, 0, sizeof log_addr);
     log_addr.sun_family = AF_UNIX;
     strncpy(log_addr.sun_path, path, sizeof log_addr.sun_path - 1);

@@ -1,5 +1,7 @@
 #include <stddef.h>
 #include <stdlib.h>
+#include <ctype.h>      // isspace: relying on the implicit declaration is an
+                        // error on clang and gcc 14+, not just a warning
 #include <string.h>
 #include <strings.h>   // strncasecmp: it lives here, not in <string.h>
 #include <ctype.h>     // isspace, used by trim() below
