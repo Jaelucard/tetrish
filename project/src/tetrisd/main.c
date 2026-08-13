@@ -445,6 +445,11 @@ static int send_response(client_t *c, htttp_status_t status,
     htttp_builder_add_header(&b, "Content-Type", "application/json");
     if (pid_hdr)
         htttp_builder_add_header(&b, "Player-Id", pid_hdr);
+    // A 429 without Retry-After tells the client it was throttled but not for
+    // how long, so its only options are to guess or to spin. The window is one
+    // second and the header is measured in seconds, so 1 is the exact wait.
+    if (status == HTTTP_429_TOO_MANY_REQUESTS)
+        htttp_builder_add_header(&b, "Retry-After", "1");
     if (body)
         htttp_builder_set_body(&b, (const unsigned char *)body, strlen(body));
 
@@ -509,7 +514,35 @@ static int check_player_id(client_t *c, const htttp_msg_t *msg){
 // each need to call into the other.
 static void disconnect_client(int fd, const char *reason);
 
+// JOIN carrying an X-Spectate header: attach as a watcher, not a player.
+// The spectator gets no seat and no game. It goes into the room's STATE
+// fan-out and receives exactly the frames a player receives. 404 when the
+// room does not exist (see room_spectate for why there is no auto-create),
+// 409 when every spectator slot is taken.
+static int do_spectate(client_t *c, const char *rid){
+    if (c->room >= 0)
+        return send_response(c, HTTTP_409_CONFLICT,
+                             "{\"error\": \"already in a room\"}", NULL);
+    int status = 0;
+    room_t *r = room_spectate(rid, c, &status);
+    if (r == NULL)
+        return send_response(c, (htttp_status_t)status,
+                             status == 404 ? "{\"error\": \"no such room\"}"
+                                           : "{\"error\": \"spectator slots full\"}", NULL);
+    slog("info", "room %s: %s spectating", r->id, c->player_id);
+    char body[128];
+    snprintf(body, sizeof body, "{\"room\": \"%s\", \"spectating\": true}", r->id);
+    return send_response(c, HTTTP_200_OK, body, c->player_id);
+}
+
 static int do_join(client_t *c, const char *rid){
+    // A spectator has to LEAVE (or disconnect) before it can play. Letting
+    // this through would seat the client in a room while it still occupies
+    // another room's spectator slot, and that slot would dangle once the
+    // client disconnects: a freed pointer in the broadcast fan-out.
+    if (c->room >= 0 && c->seat < 0)
+        return send_response(c, HTTTP_409_CONFLICT,
+                             "{\"error\": \"leave the spectated room first\"}", NULL);
     if (c->room != -1)
         return send_response(c, HTTTP_409_CONFLICT, "{\"error\": \"already in a room\"}", NULL);
 
@@ -581,6 +614,8 @@ static int do_start(client_t *c, const char *rid){
     room_t *r = room_at(c->room);
     if (r == NULL || strcmp(r->id, rid) != 0)
         return send_response(c, HTTTP_403_FORBIDDEN, "{\"error\": \"not in that room\"}", NULL);
+    if (c->seat < 0)
+        return send_response(c, HTTTP_403_FORBIDDEN, "{\"error\": \"spectators cannot start\"}", NULL);
     if (r->started)
         return send_response(c, HTTTP_409_CONFLICT, "{\"error\": \"already started\"}", NULL);
 
@@ -665,6 +700,10 @@ static int do_input(client_t *c, const char *rid, const char *pid,
     room_t *r = room_at(c->room);
     if (r == NULL || strcmp(r->id, rid) != 0)
         return send_response(c, HTTTP_403_FORBIDDEN, "{\"error\": \"not in that room\"}", NULL);
+    // As much a bounds check as a permission check: a spectator's seat is
+    // -1, and pending[c->seat] below would write before the array.
+    if (c->seat < 0)
+        return send_response(c, HTTTP_403_FORBIDDEN, "{\"error\": \"spectators cannot play\"}", NULL);
     if (!r->started)
         return send_response(c, HTTTP_409_CONFLICT, "{\"error\": \"game not started\"}", NULL);
 
@@ -684,19 +723,65 @@ static int do_input(client_t *c, const char *rid, const char *pid,
 
 // --- the dispatch pipeline ----------------------------------------------------
 
+// How many requests one connection may send per second before it is throttled.
+//
+// A human player at the default 20 Hz tick can usefully send about 20 inputs a
+// second; anything beyond that is discarded by the one-pending-input-per-seat
+// rule anyway (see do_input). 60 leaves room for a fast player plus JOIN/START
+// traffic while still catching a client that has gone into a send loop, which
+// is what actually costs the event loop time: every request is parsed,
+// dispatched and answered on the single epoll thread.
+#define CLIENT_MAX_REQ_PER_SEC 60
+
+// Returns 1 if this request should be refused with 429.
+//
+// A fixed one-second window rather than a sliding one or a token bucket: the
+// state is two fields per client and the failure mode of a fixed window (a
+// burst spanning a window boundary passes) is harmless here, because the
+// limit exists to stop a runaway client from monopolising the loop, not to
+// enforce a precise rate.
+static int rate_limited(client_t *c){
+    time_t now = time(NULL);
+    if (now != c->rl_window){       // a new second: reset the window
+        c->rl_window = now;
+        c->rl_count  = 0;
+    }
+    return ++c->rl_count > CLIENT_MAX_REQ_PER_SEC;
+}
+
 static void dispatch_request(client_t *c, const htttp_msg_t *msg){
     char rid[ROOM_ID_MAX], pid[CLIENT_ID_MAX];
     int status;
 
+    // Throttling happens before parsing the path or checking identity, because
+    // the point is to spend as little of the event loop's time as possible on
+    // a client that is flooding it.
+    if (rate_limited(c)){
+        slog("warn", "%s: rate limited (over %d requests/second)",
+             c->player_id, CLIENT_MAX_REQ_PER_SEC);
+        send_response(c, HTTTP_429_TOO_MANY_REQUESTS,
+                      "{\"error\": \"too many requests\"}", NULL);
+        return;
+    }
+
     int pathkind = parse_room_path(msg->path, rid, sizeof rid, pid, sizeof pid);
 
     switch (msg->method){
-    case HTTTP_METHOD_JOIN:
+    case HTTTP_METHOD_JOIN: {
         // JOIN is the request that hands out the identity, so it does not need
-        // a Player-Id header yet.
-        status = (pathkind == 0) ? do_join(c, rid)
-               : send_response(c, HTTTP_400_BAD_REQUEST, "{\"error\": \"bad path\"}", NULL);
+        // a Player-Id header yet. With an X-Spectate header it attaches the
+        // client as a watcher instead of seating it. Same verb, same path: a
+        // spectator "joins the room" in every sense except holding a seat, and
+        // a new method would ripple through parser, dispatch and client for no
+        // added meaning.
+        size_t xlen = 0;
+        int spectate = htttp_find_header(msg, "X-Spectate", &xlen) != NULL;
+        status = (pathkind != 0)
+               ? send_response(c, HTTTP_400_BAD_REQUEST, "{\"error\": \"bad path\"}", NULL)
+               : spectate ? do_spectate(c, rid)
+                          : do_join(c, rid);
         break;
+    }
 
     case HTTTP_METHOD_LEAVE:
     case HTTTP_METHOD_START: {
@@ -734,7 +819,7 @@ static void dispatch_request(client_t *c, const htttp_msg_t *msg){
         break;
     }
 
-    // We log every request together with the status we replied with.
+    // one line per request, whatever happened to it
     slog("info", "req %s %s %s -> %d", c->player_id, msg->method_str, msg->path, status);
 }
 
@@ -949,7 +1034,7 @@ static void handle_room_tick(room_t *r){
 
     char body[8192];
     size_t blen = 0;
-    client_t *recipients[ROOM_MAX_PLAYERS];
+    client_t *recipients[ROOM_MAX_PLAYERS + ROOM_MAX_SPECS];
     int nrec = 0;
     int garbage_rows = 0;      // total rows this room earned this tick
 
@@ -1021,6 +1106,13 @@ static void handle_room_tick(room_t *r){
                              r->players[i]->player_id, &r->games[i]);
         recipients[nrec++] = r->players[i];
     }
+    // Spectators receive the identical frame, appended to the same list so
+    // there is one send loop and one failure policy: a spectator that stops
+    // reading is dropped by the same deadline that drops a slow player,
+    // because a stalled watcher must not stall the room.
+    for (int i = 0; i < ROOM_MAX_SPECS; i++)
+        if (r->specs[i] != NULL)
+            recipients[nrec++] = r->specs[i];
     uint64_t tick_now = r->ticks;
     char path[ROOM_ID_MAX + 8];
     snprintf(path, sizeof path, "/room/%s", r->id);
@@ -1079,7 +1171,7 @@ static void handle_room_tick(room_t *r){
     char *wire = htttp_serialise(&b, &wlen);
     if (wire == NULL) return;
 
-    int failed[ROOM_MAX_PLAYERS], nfailed = 0;
+    int failed[ROOM_MAX_PLAYERS + ROOM_MAX_SPECS], nfailed = 0;
     for (int i = 0; i < nrec; i++){
         if (tetrissh_send(recipients[i]->sess, recipients[i]->fd,
                           (unsigned char *)wire, wlen) != 0)
@@ -1087,10 +1179,17 @@ static void handle_room_tick(room_t *r){
     }
     free(wire);
 
-    // If a client cannot receive a STATE frame within the 5 second send
-    // timeout, we disconnect it. Each STATE frame is the complete current
-    // board, so an old one is not worth keeping. That means there is nothing to
-    // gain from queueing frames for a slow client.
+    // If a client cannot take a STATE frame within libtetrissh's per-frame
+    // deadline, we disconnect it. Each STATE frame is the complete current
+    // board, so an old one is not worth keeping, and there is nothing to gain
+    // from queueing frames for a slow reader.
+    //
+    // The deadline is doing real work here, not just tidying up after a dead
+    // client. These sends run on the event-loop thread, one after another, so
+    // a player whose client has stopped reading (a suspended tetrisu is the
+    // easy case) backs up their socket's send buffer and blocks this loop. The
+    // bound is what keeps that one player's problem from stopping every other
+    // room's ticker as well.
     for (int i = 0; i < nfailed; i++)
         disconnect_client(failed[i], "STATE send failed (slow client)");
 }

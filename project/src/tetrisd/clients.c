@@ -1,12 +1,11 @@
-// This file implements the client registry. See clients.h for the design notes.
+// The client registry. Design notes are in clients.h.
 #include <stdio.h>
 #include <string.h>
 #include "clients.h"
 
-// This is the fd-indexed table. Each client_t is small (about 40 bytes), so
-// the whole table only takes up a couple hundred KiB of static memory.
-// Because the table is preallocated like this, we avoid calling malloc and
-// free every time a connection opens or closes.
+// The fd-indexed table. A client_t is about 40 bytes, so the whole thing is a
+// couple hundred KiB of static memory. Preallocated on purpose: no malloc and
+// no free every time a connection opens or closes.
 static client_t table[CLIENT_MAX_FD];
 static int      n_clients = 0;
 static int      initialised = 0;
@@ -28,9 +27,11 @@ client_t *client_add(int fd, tetrissh_session_t *sess, uint32_t addr){
     c->room = -1;
     c->seat = -1;
     c->addr = addr;
-    // This is the identity the server assigns and ties to this connection.
-    // The fd is unique among all connections that are currently alive, and
-    // that is the only uniqueness guarantee we need here.
+    c->rl_window = 0;                // first request opens the first window
+    c->rl_count  = 0;
+    // The identity the server assigns and ties to this connection. The fd is
+    // unique among the connections currently alive, which is the only
+    // uniqueness we need here.
     snprintf(c->player_id, sizeof c->player_id, "p%d", fd);
     n_clients++;
     return c;
@@ -46,7 +47,7 @@ client_t *client_get(int fd){
 void client_remove(int fd){
     client_t *c = client_get(fd);
     if (c == NULL) return;
-    tetrissh_session_free(c->sess);   // This frees the AES key and any leftover EVP or X509 objects from the handshake.
+    tetrissh_session_free(c->sess);   // frees the AES key and any EVP/X509 objects left from the handshake
     c->sess = NULL;
     c->fd   = -1;
     n_clients--;

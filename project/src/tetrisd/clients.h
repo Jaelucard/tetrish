@@ -1,60 +1,64 @@
-// This file holds the per-connection client state.
+// Per-connection client state.
 //
-// We keep one client_t for every TCP connection that has finished the secure
-// handshake. The registry is stored as an array indexed by fd, so looking up
-// a client is O(1) and we never need to allocate memory on the hot path. We
-// can use the fd as the index because epoll already hands us a unique fd for
-// each connection. A slot's lifetime matches the connection's lifetime: we
-// create the slot right after a successful handshake, and we destroy it when
-// the client disconnects.
+// One client_t per TCP connection that has finished the secure handshake. The
+// registry is an array indexed by fd, so a lookup is O(1) and nothing on the
+// hot path allocates. Indexing by fd works because epoll already hands us a
+// unique fd per connection. A slot lives exactly as long as its connection:
+// created right after a successful handshake, destroyed on disconnect.
 //
-// Identity model: the server picks the player_id when the handshake happens
-// and ties it to that connection. If a later request carries a Player-Id
-// header that does not match the id we assigned to that connection, we
-// reject it with 403. This stops a client from controlling another player's
-// board just by faking the header value.
+// Identity model: the server picks the player_id at handshake time and ties it
+// to that connection. A later request whose Player-Id header does not match
+// the id we assigned gets 403. That is what stops a client from driving
+// someone else's board by faking a header value.
 #ifndef CLIENTS_H
 #define CLIENTS_H
 
 #include <stdint.h>
+#include <time.h>
 #include "tetrissh.h"
 
-#define CLIENT_MAX_FD    4096   // This is the upper bound for the registry array. Any fd at or above this value is refused.
+#define CLIENT_MAX_FD    4096   // registry bound; an fd at or above this is refused
 #define CLIENT_ID_MAX    16
 
 typedef struct client {
-    int fd;                          // A value of -1 means this slot is not being used.
-    tetrissh_session_t *sess;        // The secure session for this connection. This struct owns it and must free it.
-    char player_id[CLIENT_ID_MAX];   // The player id the server assigned to this client, for example "p7".
-    int room;                        // The index of this client's room in the room table. A value of -1 means the client is in the lobby.
-    int seat;                        // The seat index for this client inside its room. A value of -1 means no seat has been assigned.
-    uint32_t addr;                   // The peer's IPv4 address in network byte order, used by the per-IP connection limit.
+    int fd;                          // -1 means this slot is free
+    tetrissh_session_t *sess;        // the secure session; this struct owns it and must free it
+    char player_id[CLIENT_ID_MAX];   // the id the server assigned, e.g. "p7"
+    int room;                        // index into the room table, -1 means the lobby
+    int seat;                        // seat inside that room, -1 means no seat (lobby, or a spectator)
+    uint32_t addr;                   // peer IPv4, network order, for the per-IP limit
+    // Request rate limiting, one fixed one-second window per connection.
+    // Going over the budget inside a window gets you a 429, not a disconnect:
+    // flooding is usually a buggy or impatient client rather than an attack,
+    // and dropping the session would lose a real player's game. See
+    // CLIENT_MAX_REQ_PER_SEC in tetrisd/main.c.
+    time_t   rl_window;              // start of the current window (seconds)
+    int      rl_count;               // requests counted in this window
 } client_t;
 
-// Registers a connection that has just finished its handshake. It returns a
-// pointer to the new slot, or NULL if the fd is out of range. If it returns
-// NULL, the caller should close the connection.
+// Registers a connection that has just finished its handshake. Returns the new
+// slot, or NULL if the fd is out of range, in which case the caller should
+// close the connection.
 client_t *client_add(int fd, tetrissh_session_t *sess, uint32_t addr);
 
-// Counts how many connected clients came from this address. The per-IP limit
-// calls this at accept() time, before anything expensive happens. The registry
-// is a flat array of CLIENT_MAX_FD slots, so this is a linear scan. That is
-// fine here: it runs once per connection attempt, not per request, and the
-// alternative (a hash table keyed by address) would be more state to keep
-// correct on every disconnect for no measurable gain at this scale.
+// How many connected clients came from this address. The per-IP limit calls
+// this at accept() time, before anything expensive happens. The registry is a
+// flat array of CLIENT_MAX_FD slots, so this is a linear scan, and that is
+// fine: it runs once per connection attempt, not per request. A hash table
+// keyed by address would be more state to keep correct on every disconnect for
+// no measurable gain at this scale.
 int client_count_addr(uint32_t addr);
 
-// Looks up a client by fd in constant time (O(1)). Returns NULL if no client is stored at that fd.
+// O(1) lookup by fd. NULL if no client is stored there.
 client_t *client_get(int fd);
 
-// Frees the session and clears the slot. This function does not close the
-// fd. The caller owns the socket, and the caller is also responsible for
-// removing it from the epoll set.
+// Frees the session and clears the slot. Does NOT close the fd: the socket
+// belongs to the caller, and so does removing it from the epoll set.
 void client_remove(int fd);
 
 int client_count(void);
 
-// Calls fn once for every client that is currently connected. It loops over every slot in the table and calls fn on each one that is in use.
+// Calls fn once for every connected client.
 void client_foreach(void (*fn)(client_t *c, void *arg), void *arg);
 
 #endif

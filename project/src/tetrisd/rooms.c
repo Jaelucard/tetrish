@@ -1,19 +1,17 @@
-// This file implements the room table. See rooms.h for the full
-// explanation of the locking rules.
+// The room table. The locking rules are explained at the top of rooms.h.
 #include <stdio.h>
 #include <string.h>
 #include "rooms.h"
 
 static room_t table[ROOM_HARD_MAX];
-static int cap_rooms   = 16;   // These two variables hold the runtime limits, which come from .tetrishrc.
+static int cap_rooms   = 16;   // the runtime limits, both from .tetrishrc
 static int cap_players = 6;
 static int n_rooms     = 0;
 
 void rooms_init(int max_rooms, int max_players_per_room){
-    // Here we clamp the runtime limits so they can never be bigger than the
-    // compile-time array sizes. This way, a typo in the config file, such
-    // as setting max_rooms to 999, cannot make later code read or write
-    // past the end of an array.
+    // Clamp the runtime limits to the compile-time array sizes, so a typo in
+    // the config file (max_rooms 999, say) cannot make later code run off the
+    // end of an array.
     cap_rooms   = (max_rooms   > 0 && max_rooms   <= ROOM_HARD_MAX)    ? max_rooms   : ROOM_HARD_MAX;
     cap_players = (max_players_per_room > 0 &&
                    max_players_per_room <= ROOM_MAX_PLAYERS)           ? max_players_per_room : ROOM_MAX_PLAYERS;
@@ -46,37 +44,38 @@ room_t *room_by_timerfd(int tfd){
     for (int i = 0; i < cap_rooms; i++)
         if (table[i].active && table[i].timer_fd == tfd)
             return &table[i];
-    return NULL;      // This is a plain linear scan over the table. That is fine because max_rooms is small, at most 32, by design.
+    return NULL;      // plain linear scan; cap_rooms is at most ROOM_HARD_MAX (128), and this runs once per tick per room
 }
 
 room_t *room_join(const char *id, client_t *c, int *status){
     room_t *r = room_find(id);
 
     if (r == NULL){
-        // The protocol has no separate CREATE method, so JOIN creates the
-        // room automatically the first time someone tries to join it. We
-        // let the client tell which case happened by returning 201 when a
-        // new room was created, and 200 when the client joined a room that
-        // already existed.
+        // The protocol has no CREATE method, so JOIN creates the room the
+        // first time anyone tries to join it. The client tells the two cases
+        // apart from the status: 201 for a room we just made, 200 for one that
+        // was already there.
         for (int i = 0; i < cap_rooms; i++){
             if (!table[i].active){
                 r = &table[i];
                 break;
             }
         }
-        if (r == NULL){ *status = 500; return NULL; }   // We get here if every slot in the room table is already in use.
+        if (r == NULL){ *status = 500; return NULL; }   // every slot in the table is in use
 
         pthread_mutex_lock(&r->mu);
         r->active   = 1;
         snprintf(r->id, sizeof r->id, "%s", id);
         r->started  = 0;
         r->timer_fd = -1;
+        r->tick_hz  = 0;      // set at START, from the config live at that moment
         r->ticks    = 0;
         r->nplayers = 0;
         memset(r->players, 0, sizeof r->players);
+        memset(r->specs,   0, sizeof r->specs);
         pthread_mutex_unlock(&r->mu);
         n_rooms++;
-        *status = 201;                                  // This means a new room was created.
+        *status = 201;                                  // created
     } else {
         // Joining a room whose game is already running is allowed.
         //
@@ -97,7 +96,7 @@ room_t *room_join(const char *id, client_t *c, int *status){
         // The one thing the caller MUST do is seed this seat's game, because
         // the seeding that normally happens on START has already been and
         // gone. See the join handler in tetrisd.
-        *status = 200;                                  // This means the client is joining a room that already existed.
+        *status = 200;                                  // joined one that already existed
     }
 
     pthread_mutex_lock(&r->mu);
@@ -107,7 +106,7 @@ room_t *room_join(const char *id, client_t *c, int *status){
     }
     if (seat < 0){
         pthread_mutex_unlock(&r->mu);
-        *status = 409;                                  // This means the room has no empty seats left.
+        *status = 409;                                  // no empty seats left
         return NULL;
     }
     r->players[seat] = c;
@@ -120,10 +119,51 @@ room_t *room_join(const char *id, client_t *c, int *status){
     return r;
 }
 
+room_t *room_spectate(const char *id, client_t *c, int *status){
+    room_t *r = room_find(id);
+    if (r == NULL){
+        // Deliberately no auto-create here, unlike room_join. JOIN creates a
+        // room so the first player has somewhere to sit; a spectator with
+        // nothing to watch is a mistyped room name, and creating an empty
+        // room for it would tick nothing and confuse everyone.
+        *status = 404;
+        return NULL;
+    }
+
+    pthread_mutex_lock(&r->mu);
+    int slot = -1;
+    for (int i = 0; i < ROOM_MAX_SPECS; i++)
+        if (r->specs[i] == NULL){ slot = i; break; }
+    if (slot < 0){
+        pthread_mutex_unlock(&r->mu);
+        *status = 409;
+        return NULL;
+    }
+    r->specs[slot] = c;
+    pthread_mutex_unlock(&r->mu);
+
+    c->room = room_index(r);
+    c->seat = -1;                 // no seat is what MAKES it a spectator
+    *status = 200;
+    return r;
+}
+
 int room_leave(client_t *c){
     room_t *r = room_at(c->room);
-    if (r == NULL || c->seat < 0)
+    if (r == NULL)
         return -1;
+
+    if (c->seat < 0){
+        // A spectator: clear the watch slot and go back to the lobby. No
+        // seat means no vote in whether the room lives on, so this can
+        // never be the leave that destroys the room.
+        pthread_mutex_lock(&r->mu);
+        for (int i = 0; i < ROOM_MAX_SPECS; i++)
+            if (r->specs[i] == c) r->specs[i] = NULL;
+        pthread_mutex_unlock(&r->mu);
+        c->room = -1;
+        return -1;
+    }
 
     pthread_mutex_lock(&r->mu);
     if (r->players[c->seat] == c){
@@ -139,10 +179,20 @@ int room_leave(client_t *c){
     if (!empty)
         return -1;
 
-    // If the last player has just left, we destroy the room and hand the
-    // now-orphaned timerfd back to the caller. We do this because removing
-    // it from epoll and closing it are jobs for the event loop, not for
-    // this data-structure module.
+    // The last player has just left, so destroy the room and hand the
+    // now-orphaned timerfd back to the caller. Removing it from epoll and
+    // closing it are jobs for the event loop, not for this module.
+    //
+    // Any spectators still watching go back to the lobby first. Their client_t
+    // would otherwise keep pointing at this slot, so the next room created here
+    // would inherit watchers it never admitted. Worse, a spectator that
+    // disconnected in between would leave a freed pointer in specs[] for the
+    // broadcast loop to chase.
+    for (int i = 0; i < ROOM_MAX_SPECS; i++)
+        if (r->specs[i] != NULL){
+            r->specs[i]->room = -1;
+            r->specs[i] = NULL;
+        }
     int orphan_tfd = r->timer_fd;
     r->active   = 0;
     r->started  = 0;
