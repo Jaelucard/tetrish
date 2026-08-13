@@ -918,8 +918,20 @@ static size_t render_board(char *dst, size_t cap, const char *pid, const tb_game
                             "player %s score %u level %u lines %u over %d\n",
                             pid, g->score, g->level, g->lines_total, g->game_over ? 1 : 0);
     for (int y = 0; y < TB_ROWS && off + TB_COLS + 2 < cap; y++){
-        for (int x = 0; x < TB_COLS; x++)
-            dst[off++] = cells[y][x] ? (char)('0' + (cells[y][x] % 10)) : '.';
+        for (int x = 0; x < TB_COLS; x++){
+            int8_t c = cells[y][x];
+            // tb_render's contract: -1 is empty, 0..6 is a piece type (locked
+            // or active), anything larger is garbage. A truthiness test here
+            // reads that contract backwards twice: -1 (empty) is truthy, so
+            // every empty cell rendered as a block, and type 0 (the O piece)
+            // is falsy, so O pieces rendered as holes. No automated harness
+            // ever LOOKED at a drawn frame, which is how it survived until
+            // the first visual pass. '1'..'7' matches the client renderer's
+            // colour pairs; '8' is its garbage/fallback pair.
+            dst[off++] = (c < 0)  ? '.'
+                       : (c <= 6) ? (char)('1' + c)
+                                  : '8';
+        }
         dst[off++] = '\n';
     }
     dst[off] = '\0';
@@ -1194,11 +1206,28 @@ static void handle_garbage(mqd_t mq){
 
 struct jbuf { char buf[4096]; size_t off; int first; };
 
+// Append to the reply buffer, truncating rather than overflowing.
+//
+// vsnprintf returns the length it WOULD have written, not the length it did.
+// Advancing off by that return value lets off grow past the end of the buffer
+// once it fills; the next call then computes `sizeof j->buf - j->off` as a
+// size_t subtraction that underflows to a huge value, and vsnprintf writes
+// freely past the end of a stack buffer. Reproduced with 90 rooms: a 5392-byte
+// body into 4096 bytes, overwriting the htttp_msg_t in the same frame.
+//
+// So: refuse to write when the buffer is full, and advance by what was
+// actually stored. The reply truncates instead. Returning the full list at
+// that size would need a bigger buffer or a streamed body, which is a larger
+// change than this bug deserves.
 static void jb_append(struct jbuf *j, const char *fmt, ...){
+    size_t space = sizeof j->buf - j->off;
+    if (space == 0) return;                  // full; another append would underflow
     va_list ap;
     va_start(ap, fmt);
-    j->off += (size_t)vsnprintf(j->buf + j->off, sizeof j->buf - j->off, fmt, ap);
+    int n = vsnprintf(j->buf + j->off, space, fmt, ap);
     va_end(ap);
+    if (n < 0) return;                       // encoding error: leave the buffer as it was
+    j->off += ((size_t)n >= space) ? space - 1 : (size_t)n;   // what was stored, not what was wanted
 }
 
 static void jb_room(room_t *r, void *arg){
