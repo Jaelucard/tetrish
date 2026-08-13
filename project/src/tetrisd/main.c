@@ -64,6 +64,7 @@
 #include <sys/epoll.h>
 #include <sys/timerfd.h>     // per-room tickers
 #include <sys/socket.h>
+#include <sys/stat.h>        // umask, mode_t: the control socket's permissions
 #include <sys/time.h>
 #include <time.h>            // clock_gettime, struct timespec (uptime)
 #include <netinet/in.h>
@@ -80,11 +81,7 @@
 #include "rooms.h"
 #include "garbage.h"         // the Battle Royale garbage event format
 
-// The garbage event format lives in garbage.h so that test tools can build a
-// well-formed message without duplicating the struct.
-
-// A few daemon-wide singletons. A daemon has exactly one config, one epoll
-// set and one log ring
+// Daemon-wide singletons: one config, one epoll set, one log ring.
 static Config g_cfg;
 static int    g_ep = -1;
 
@@ -393,10 +390,8 @@ static unsigned long total_dropped(void){
     return ring_dropped(&g_ring) + atomic_load(&dropped_send);
 }
 
-// a function to check how many seconds since the daemon started
-// start off with making a blank timespec to hold a time
-// then call clock_gettime with CLOCK_MONOTONIC to get the current time
-// then return the difference between the current time and the start time in seconds
+// seconds since the daemon started. monotonic, per the note on g_started, so
+// this can never come out negative.
 static long uptime_seconds(void){
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -495,8 +490,46 @@ static int ctl_listen(const Config *cfg){
     }
     strncpy(addr.sun_path, cfg->ctl_path, sizeof addr.sun_path - 1);
 
+    // Refuse to start if another tetrisd already owns this control socket.
+    //
+    // bind() cannot tell us, because the unlink() below removes whatever is
+    // sitting there: a second daemon would silently take the address from the
+    // first, which then keeps running attached to a socket no tetrisctl can
+    // reach any more. A different listen_port is no protection either, since
+    // the TCP listener and the control socket are independent addresses and
+    // only the former can report EADDRINUSE.
+    //
+    // The AF_UNIX way to ask "is anyone actually there?" is to try to connect.
+    // A live listener accepts, a socket file left behind by a crashed run
+    // refuses with ECONNREFUSED, and a path with nothing at it gives ENOENT.
+    int probe = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (probe >= 0){
+        int live = (connect(probe, (struct sockaddr *)&addr, sizeof addr) == 0);
+        close(probe);
+        if (live){
+            fprintf(stderr, "tetrisd: another tetrisd already owns %s\n", cfg->ctl_path);
+            close(fd); return -1;
+        }
+    }
+
     unlink(cfg->ctl_path);
-    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0){
+
+    // Create the socket node with the permissions ctl_perm asks for.
+    //
+    // bind() is what creates the node, and it applies the process umask like
+    // any other file creation. Without this the mode is whatever mask we happen
+    // to have inherited, which leaves the control plane readable and writable
+    // by every local user: /shutdown takes no credentials, so anyone who can
+    // open the socket can stop a running tournament.
+    //
+    // The mask is set around bind() rather than chmod()ing afterwards because
+    // bind() and chmod() are two steps, and between them the socket exists at
+    // the wrong mode and will accept a connection from anyone who gets there
+    // first. Setting the mask makes the node arrive correct instead.
+    mode_t old_umask = umask((mode_t)(0777 & ~cfg->ctl_perm));
+    int rc = bind(fd, (struct sockaddr *)&addr, sizeof addr);
+    umask(old_umask);
+    if (rc < 0){
         perror("bind(ctl)"); close(fd); return -1;
     }
     if (listen(fd, 8) < 0){ perror("listen(ctl)"); close(fd); return -1; }
@@ -1609,7 +1642,6 @@ int main(int argc, char **argv){
         fprintf(stderr, "tetrisd: failed to load configuration from %s\n", rc_path);
         return 1;
     }
-    // After the room system is initialized, record the daemon's start time in g_started
     rooms_init(g_cfg.max_rooms, g_cfg.max_players_per_room);
     adjust_fd_limit();
     clock_gettime(CLOCK_MONOTONIC, &g_started);
@@ -1664,6 +1696,23 @@ int main(int argc, char **argv){
     }
     g_mq = mq;                 // the tick handler sends through this
 
+    // Remember the names we actually bound, so shutdown removes those and not
+    // whatever the config happens to say by then.
+    //
+    // A SIGHUP reload replaces g_cfg wholesale, but the listeners and the queue
+    // keep the addresses they were created with (the reload log line says so).
+    // Reading g_cfg at shutdown therefore unlinks the NEW paths: names this
+    // process never created, which may well belong to a second daemon started
+    // against the edited config, while leaving its own socket, pid file and
+    // message queue behind. Snapshotting the three names at the point of
+    // creation keeps "what we made" and "what we destroy" the same set.
+    char bound_ctl_path[RC_PATHLEN];
+    char bound_pid_path[RC_PATHLEN];
+    char bound_garbage_mq[RC_PATHLEN];
+    snprintf(bound_ctl_path,   sizeof bound_ctl_path,   "%s", g_cfg.ctl_path);
+    snprintf(bound_pid_path,   sizeof bound_pid_path,   "%s", g_cfg.pid_path);
+    snprintf(bound_garbage_mq, sizeof bound_garbage_mq, "%s", g_cfg.garbage_mq);
+
     // Seed the targeting PRNG. getpid keeps two daemons on one machine from
     // picking identical target sequences. This randomness never touches game
     // state, because libtetrisbrain has its own seeded PRNG for that.
@@ -1682,7 +1731,7 @@ int main(int argc, char **argv){
     // 8. Write the process id file. We do this after daemonizing, so that the
     //    file holds the daemon's real process id and not the one of the parent
     //    that has already exited.
-    write_pidfile(g_cfg.pid_path);
+    write_pidfile(bound_pid_path);
 
     // 9. Set up the log ring buffer and start the logshipper thread. This must
     //    happen after daemonizing, because fork() only keeps the thread that
@@ -1705,7 +1754,13 @@ int main(int argc, char **argv){
     // 10. Create the signalfd. This turns the signals we blocked earlier into
     //     something we can read from as if it were a file, so the event loop
     //     can wait on them together with the sockets.
-    int sig_fd = signalfd(-1, &mask, SFD_CLOEXEC);
+    //     SFD_NONBLOCK matters as much as the signalfd itself. epoll telling us
+    //     the descriptor is readable is not a promise that a full siginfo is
+    //     waiting, and a blocking read() that guesses wrong parks the one
+    //     thread that runs every room, with no timeout to recover from. The
+    //     handler already copes with a short read by returning, so the only
+    //     thing missing was the flag that lets the read fail instead of block.
+    int sig_fd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
     if (sig_fd < 0){ perror("signalfd"); close(listen_fd); close(ctl_fd); return 1; }
 
     // 11. Create the epoll set and add our fixed file descriptors to it: the
@@ -1811,8 +1866,18 @@ int main(int argc, char **argv){
     slog("info", "tetrisd: phase 4: closing descriptors and exiting");
 
     // The shipper exits only once the ring is empty AND the stop flag is set,
-    // so the join below is what guarantees the four records above actually
-    // reached tetrislogd before we close the socket.
+    // so the join below guarantees that everything which REACHED the ring is
+    // sent before we close the socket.
+    //
+    // It does not guarantee the four records above are among them, and the
+    // distinction is worth being precise about. slog() reaches the ring through
+    // ring_push, which uses trylock and drops the record outright when the
+    // shipper happens to hold the mutex. Phase 2 pushes one record per
+    // disconnected client in a tight burst against a shipper that takes the
+    // lock every millisecond, so under load a share of those, and possibly a
+    // phase line with them, are dropped exactly like any other record. That is
+    // the deal the trylock buys: the game never waits on logging, and no record
+    // is ever guaranteed. The drop counters are what make the loss visible.
     atomic_store(&shipper_stop, 1);
     pthread_join(shipper, NULL);
 
@@ -1820,10 +1885,10 @@ int main(int argc, char **argv){
     close(sig_fd);
     close(ctl_fd);
     mq_close(mq);
-    mq_unlink(g_cfg.garbage_mq);
+    mq_unlink(bound_garbage_mq);
     if (log_fd >= 0) close(log_fd);
-    unlink(g_cfg.ctl_path);
-    unlink(g_cfg.pid_path);
+    unlink(bound_ctl_path);
+    unlink(bound_pid_path);
     ring_destroy(&g_ring);
     return 0;
 }
