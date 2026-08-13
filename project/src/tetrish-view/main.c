@@ -1,53 +1,73 @@
-// tetrish-view replays a recorded game session from tetrislogd's log file.
+// tetrish-view: replay a recorded session from tetrislogd's log file, or watch
+// a live room. Two modes, one renderer.
 //
-// HOW REPLAY WORKS, AND WHY IT IS TRUSTWORTHY
+// WHY THE REPLAY CAN BE TRUSTED
 //
-// libtetrisbrain is deterministic by contract: no wall-clock time, no rand(),
-// no I/O. A game is entirely determined by its seed plus the sequence of inputs
-// it was fed and the tick each one landed on. tetrisd records exactly that:
+// libtetrisbrain is deterministic by contract: no wall clock, no rand(), no
+// I/O. A game is its seed plus the inputs it was fed and the tick each one
+// landed on. tetrisd records exactly that:
 //
 //   E <ns> <tick> <room> <player> SEED    <seed>
 //   E <ns> <tick> <room> <player> INPUT   <LEFT|RIGHT|ROTATE_CW|...>
 //   E <ns> <tick> <room> <player> GARBAGE <rows> <hole_pattern_hex>
-//   S <ns> <tick> <room> <player> <w> <h> <cells_hex>
+//   S <ns> <tick> <room> <player> <w> <h> <cells_hex> <seed>
 //
-// So replaying is mechanical: seed the engine, then walk tick 0..N calling
-// tb_tick once per tick with whatever input that tick carried.
+// so replay is mechanical: seed the engine, walk tick 0..N, feed tb_tick
+// whatever input that tick carried.
 //
-// The important design rule is borrowed from how Quake 3 plays back demos. Its
-// CL_ReadDemoMessage feeds recorded packets into CL_ParseServerMessage, the
-// very same function that handles live network traffic, so a demo cannot drift
-// away from real play because there is only one code path. The equivalent here
-// is that this program calls tb_tick, the same engine entry point tetrisd calls
-// on every room tick. It does not reimplement gravity, locking or line clears.
-// If replay and live ever disagree, that is a bug in one caller, not a
-// disagreement between two rival implementations of the rules.
+// The rule is lifted from Quake 3 demo playback. Its CL_ReadDemoMessage pushes
+// recorded packets through CL_ParseServerMessage, the same function that
+// handles live traffic, so a demo cannot drift from real play; there is only
+// one code path. Same idea here: this calls tb_tick, the engine entry point
+// tetrisd calls on every room tick. Gravity, locking and line clears are not
+// reimplemented. If replay and live disagree, one caller is wrong, rather than
+// two rival copies of the rules.
 //
 // WHAT SNAPSHOTS ARE FOR HERE
 //
-// Not seeking. A snapshot restores the visible board but NOT the random number
-// generator or the position in the 7-piece bag, so jumping to one would make
-// every subsequent piece differ from the real game. Quake 3 sidesteps the whole
-// problem by refusing to seek at all. We do not have to: a few minutes at 20 Hz
-// is a few thousand tb_tick calls, which costs microseconds, so seeking simply
-// replays from tick 0 and is exactly correct.
+// Not seeking. A snapshot restores the visible board but NOT the RNG or the
+// position in the 7-piece bag, so jumping to one makes every piece after it
+// differ from the real game. Quake 3 ducks this by refusing to seek at all. We
+// do not have to: a few minutes at 20 Hz is a few thousand tb_tick calls, which
+// costs microseconds, so a seek just replays from tick 0 and is exactly right.
 //
-// That frees snapshots to do something more valuable: verification. The
-// reconstruction is compared against every recorded snapshot as it goes. A
-// mismatch means a record never reached the log, which does happen under load
-// because the logging path deliberately drops rather than blocking the game.
-// Detecting a divergent replay is worth more than a fast one, so a mismatch is
-// counted, reported on screen, and then resynced from the snapshot so the
-// viewer keeps showing something truthful.
+// Which frees snapshots up for verification instead. The reconstruction is
+// compared against every recorded snapshot as it goes. A mismatch means a
+// record never reached the log, which does happen under load, because the
+// logging path drops rather than blocking the game. Catching a diverged replay
+// beats a fast one, so a mismatch is counted, said out loud on screen, then
+// resynced from the snapshot so the viewer keeps showing something true.
 //
-// usage: tetrish-view <log-file> [room] [player]
+// Snapshots also re-state the seat's seed, every time. The SEED record is
+// written once, at START, which is when the logging path is busiest and most
+// likely to drop, so a session with a lost SEED used to be unreplayable
+// outright. Now one surviving snapshot is enough to seed the reconstruction.
+//
+// usage: tetrish-view <log-file> [room] [player]        (replay mode)
+//        tetrish-view --live <rc-file> [room]           (live spectator mode)
 //        keys: space pause, left/right seek, +/- speed, q quit
+//
+// Live mode is the other half (see live_main below). Instead of rebuilding a
+// finished session from the log file it attaches to a running tetrisd as a
+// spectator: full secure handshake, then a JOIN carrying an X-Spectate header
+// so the server hands out no seat. STATE broadcasts are rendered as they
+// arrive, through the same shared renderer tetrisu uses.
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <unistd.h>
+#include <errno.h>
+#include <time.h>
 #include <ncurses.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include "rc.h"
+#include "stateview.h"
 #include "tetrisbrain.h"
 
 #define MAX_EVENTS  65536
@@ -60,7 +80,7 @@ typedef enum { EV_SEED, EV_INPUT, EV_GARBAGE, EV_SNAPSHOT } ev_kind;
 typedef struct {
     ev_kind  kind;
     uint64_t tick;
-    uint32_t seed;                            // EV_SEED
+    uint32_t seed;                            // EV_SEED; also EV_SNAPSHOT (re-stated there, 0 in old logs)
     tb_input input;                           // EV_INPUT
     int      rows;                            // EV_GARBAGE
     uint16_t hole;                            // EV_GARBAGE
@@ -73,9 +93,9 @@ static volatile sig_atomic_t g_quit = 0;
 
 static void on_sigint(int sig){ (void)sig; g_quit = 1; }
 
-// Used instead of exit() once ncurses owns the terminal. Without restoring the
-// terminal first, the message scrolls into a screen still in curses mode and
-// the shell is left unusable afterwards.
+// Instead of exit(), once ncurses owns the terminal. Skip the endwin and the
+// message scrolls into a screen still in curses mode, leaving the shell
+// unusable afterwards.
 static void die(const char *msg){
     endwin();
     fprintf(stderr, "tetrish-view: %s\n", msg);
@@ -92,10 +112,9 @@ static tb_input input_from_name(const char *s){
     return TB_INPUT_NONE;
 }
 
-// Encode the board the same way tetrisd encodes a snapshot, so a
-// reconstruction can be compared against a recorded one byte for byte. Reads
-// the locked stack only, exactly as the server does, so the in-flight piece
-// never causes a false mismatch.
+// Encode the board the way tetrisd encodes a snapshot, so a reconstruction can
+// be compared against a recorded one byte for byte. Locked stack only, exactly
+// as the server does, or the in-flight piece would fake a mismatch.
 static void board_hex(const tb_game *g, char *out, size_t cap){
     static const char digits[] = "0123456789abcdef";
     size_t n = 0;
@@ -110,10 +129,10 @@ static void board_hex(const tb_game *g, char *out, size_t cap){
     out[n] = '\0';
 }
 
-// Restore a board from a recorded snapshot. Used only to resync after a
-// detected divergence. It fixes what the viewer draws, but it cannot restore
-// the engine's PRNG or bag position, so pieces after this point are the
-// reconstruction's own rather than the ones the player really saw.
+// Restore a board from a recorded snapshot. Only used to resync after a
+// divergence is spotted. Fixes what the viewer draws, but cannot put back the
+// engine's PRNG or bag position, so pieces after this point are the
+// reconstruction's own, not the ones the player really saw.
 static void board_from_hex(tb_game *g, const char *hex){
     size_t n = 0;
     for (int y = 1; y <= TB_ROWS; y++)
@@ -128,12 +147,12 @@ static void board_from_hex(tb_game *g, const char *hex){
         }
 }
 
-// Read the log and keep the records for one room and player.
+// Read the log, keep the records for one room and player.
 //
 // Lines look like:  2026-08-02 10:25:23 E 1234 480 roomA p7 INPUT LEFT
-// tetrislogd prepends its own date and time, so the record itself starts at the
-// third whitespace-separated field. Anything that is not a well-formed E or S
-// record for the requested player is skipped, which is what lets replay records
+// tetrislogd puts its own date and time on the front, so the record starts at
+// the third whitespace-separated field. Anything that is not a well-formed E or
+// S record for the player we want gets skipped, which is how replay records
 // share a file with ordinary prose logging.
 static int load_log(const char *path, const char *want_room,
                     const char *want_player, char *room_out, char *player_out,
@@ -147,10 +166,9 @@ static int load_log(const char *path, const char *want_room,
 
     while (fgets(line, sizeof line, f) != NULL){
         size_t len = strlen(line);
-        // A line with no newline means the file was cut off mid-write, which
-        // happens when the daemon is killed. Quake 3 checks its demo files the
-        // same way and reports the truncation rather than trusting a partial
-        // record.
+        // No trailing newline means the file was cut off mid-write, which is
+        // what a killed daemon leaves behind. Quake 3 checks its demo files
+        // the same way: report the truncation, do not trust a half record.
         if (len > 0 && line[len - 1] != '\n'){ *truncated = 1; break; }
 
         char date[32], hhmmss[32], type[8], room[64], player[64], action[32];
@@ -165,12 +183,11 @@ static int load_log(const char *path, const char *want_room,
         if (want_room[0]   && strcmp(room, want_room)     != 0) continue;
         if (want_player[0] && strcmp(player, want_player) != 0) continue;
 
-        // Lock on to the first session we see and ignore every other one.
-        // A single log file holds every room and player the daemon served, and
-        // blending two of them produces a reconstruction that matches neither:
-        // two SEED records means two different piece sequences fighting over
-        // one board. Without this, running with no room named silently
-        // replayed nonsense.
+        // Lock on to the first session seen, ignore the rest. One log file
+        // holds every room and player the daemon served, and blending two of
+        // them rebuilds neither: two SEED records means two piece sequences
+        // fighting over one board. Before this, running with no room named
+        // replayed nonsense and said nothing.
         if (room_out[0] == '\0'){
             snprintf(room_out, 64, "%s", room);
             snprintf(player_out, 64, "%s", player);
@@ -186,15 +203,20 @@ static int load_log(const char *path, const char *want_room,
 
         if (type[0] == 'S'){
             int w, h;
-            // Exactly one hex digit per visible cell, so the field width, this
-            // buffer and e->cells all have to agree at TB_ROWS * TB_COLS. A
-            // wider sscanf width than the destination is how buffers get
-            // overrun, and the compiler will say so.
+            // One hex digit per visible cell, so the sscanf width, this buffer
+            // and e->cells all have to agree at TB_ROWS * TB_COLS. A width
+            // wider than the destination is how buffers get overrun.
             char hex[TB_ROWS * TB_COLS + 1];
-            if (sscanf(rest, " %d %d %200s", &w, &h, hex) != 3) continue;
+            unsigned s = 0;
+            // Trailing seed is optional: logs from before snapshots re-stated
+            // it have three fields only. Such a snapshot still verifies a
+            // board, it just cannot seed a replay on its own.
+            int n = sscanf(rest, " %d %d %200s %u", &w, &h, hex, &s);
+            if (n < 3) continue;
             if (w != TB_COLS || h != TB_ROWS) continue;  // a board we cannot draw
             e->kind = EV_SNAPSHOT;
             snprintf(e->cells, sizeof e->cells, "%s", hex);
+            if (n == 4){ e->seed = s; seen_seed = 1; }
         } else {
             if (sscanf(rest, " %31s", action) != 1) continue;
             if (strcmp(action, "SEED") == 0){
@@ -223,14 +245,23 @@ static int load_log(const char *path, const char *want_room,
 
 // Replay from tick 0 up to and including target_tick.
 //
-// Deliberately always from the beginning. Starting from a snapshot would be
-// faster but wrong: a snapshot carries the board and nothing else, so the piece
-// sequence after it would be invented rather than replayed.
+// Always from the beginning, on purpose. Starting at a snapshot would be
+// faster and wrong: a snapshot carries the board and nothing else, so every
+// piece after it would be invented rather than replayed.
 static void rebuild(tb_game *g, uint64_t target_tick, int *mismatches,
                     uint64_t *last_verified){
     uint32_t seed = 0;
     for (int i = 0; i < g_nev; i++)
         if (g_ev[i].kind == EV_SEED){ seed = g_ev[i].seed; break; }
+    // SEED is written once, into the busiest burst the logging path ever
+    // sees, so it is the record most likely to be missing. Every snapshot
+    // re-states it; any survivor will do. load_log only admits a session that
+    // produced a seed one way or the other.
+    if (seed == 0)
+        for (int i = 0; i < g_nev; i++)
+            if (g_ev[i].kind == EV_SNAPSHOT && g_ev[i].seed != 0){
+                seed = g_ev[i].seed; break;
+            }
 
     tb_init(g, seed);
     *mismatches    = 0;
@@ -242,8 +273,8 @@ static void rebuild(tb_game *g, uint64_t target_tick, int *mismatches,
 
         while (idx < g_nev && g_ev[idx].tick < t) idx++;
 
-        // Apply every record stamped with this tick. An input feeds the tick;
-        // garbage is injected directly, exactly as the server injects it.
+        // Every record stamped with this tick. An input feeds the tick,
+        // garbage goes in directly, exactly as the server injects it.
         for (int j = idx; j < g_nev && g_ev[j].tick == t; j++){
             if (g_ev[j].kind == EV_INPUT)
                 in = g_ev[j].input;
@@ -253,7 +284,7 @@ static void rebuild(tb_game *g, uint64_t target_tick, int *mismatches,
 
         tb_tick(g, in);                       // the same call tetrisd makes
 
-        // Verify against a snapshot for this tick, if the log recorded one.
+        // Check against this tick's snapshot, if the log recorded one.
         for (int j = idx; j < g_nev && g_ev[j].tick == t; j++){
             if (g_ev[j].kind != EV_SNAPSHOT) continue;
             char mine[TB_ROWS * TB_COLS + 1];
@@ -310,8 +341,8 @@ static void draw(const tb_game *g, const char *room, const char *player,
              paused ? "PAUSED " : "playing", speed);
     mvprintw(f + 2, BOARD_LEFT, "score %u  lines %u", g->score, g->lines_total);
 
-    // Say plainly how much of this reconstruction is trustworthy. A viewer that
-    // quietly shows a diverged board is worse than one that admits it.
+    // Say how much of this reconstruction can be trusted. A viewer that shows
+    // a diverged board and keeps quiet about it is worse than one that owns up.
     if (mismatches > 0){
         attron(A_BOLD);
         mvprintw(f + 3, BOARD_LEFT,
@@ -329,22 +360,203 @@ static void draw(const tb_game *g, const char *room, const char *player,
     refresh();
 }
 
+// --- live spectator mode (50.003) -------------------------------------------
+
+// Tear down a live connection. Safe on a half-open one, which is what keeps
+// the reconnect loop simple: every failure path funnels through here.
+static void live_drop(stateview_t *v){
+    if (v->sess){ tetrissh_session_free(v->sess); v->sess = NULL; }
+    if (v->sock >= 0){ close(v->sock); v->sock = -1; }
+}
+
+// Connect, handshake, JOIN as a spectator. On failure it writes a readable
+// reason into err and leaves v fully torn down. The socket timeouts bound
+// every blocking step, so one attempt costs seconds at worst, never forever.
+static int live_connect(const Config *cfg, const char *room, stateview_t *v,
+                        char *err, size_t errsz){
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0){ snprintf(err, errsz, "socket: %s", strerror(errno)); return -1; }
+
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port   = htons((uint16_t)cfg->listen_port);
+    if (inet_pton(AF_INET, cfg->bind_addr, &sa.sin_addr) != 1){
+        snprintf(err, errsz, "bad server address %s", cfg->bind_addr);
+        close(fd); return -1;
+    }
+    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) < 0){
+        snprintf(err, errsz, "connect: %s", strerror(errno));
+        close(fd); return -1;
+    }
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    struct timeval to = { .tv_sec = 5, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof to);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &to, sizeof to);
+
+    v->sess = tetrissh_session_alloc();
+    if (v->sess == NULL){
+        snprintf(err, errsz, "out of memory");
+        close(fd); return -1;
+    }
+    v->sock = fd;
+    if (tetrissh_handshake_client(v->sess, v->sock, cfg->ca_path) != 0){
+        snprintf(err, errsz, "handshake: %s", tetrissh_strerror(v->sess));
+        live_drop(v); return -1;
+    }
+
+    char path[64], keep[4096];
+    htttp_msg_t msg;
+    snprintf(path, sizeof path, "/room/%s", room);
+    if (sv_send_request(v, HTTTP_METHOD_JOIN, path, NULL, "X-Spectate", "1") != 0){
+        snprintf(err, errsz, "JOIN send failed");
+        live_drop(v); return -1;
+    }
+    int st = sv_read_until_response(v, &msg, keep, sizeof keep);
+    if (st != 200){
+        snprintf(err, errsz, "spectator JOIN refused: status %d%s", st,
+                 st == 404 ? " (no such room - is a game running?)" : "");
+        live_drop(v); return -1;
+    }
+    size_t vlen = 0;
+    const char *pid = htttp_find_header(&msg, "Player-Id", &vlen);
+    if (pid != NULL && vlen > 0 && vlen < sizeof v->player_id){
+        memcpy(v->player_id, pid, vlen);
+        v->player_id[vlen] = '\0';
+    }
+    return 0;
+}
+
+// Watch a room live. The loop is select() over stdin and the socket, tetrisu's
+// shape minus the game keys: the only input is q.
+//
+// Reconnection is the one piece of real logic in this mode. A viewer exists to
+// watch somebody ELSE's game, so a tetrisd restart must not kill it. On a dead
+// connection it keeps the terminal, says what happened, and retries with
+// exponential backoff: 1s doubling to a 30s cap, reset once a connection
+// sticks. That is the usual shape for not hammering a server that is busy
+// coming back up. The FIRST connection is the exception and fails loud and
+// fast, because a mistyped room name deserves an error message, not a silent
+// retry forever.
+static int live_main(const char *rc_path, const char *room){
+    Config cfg;
+    if (rc_load(rc_path, &cfg) != 0){
+        fprintf(stderr, "tetrish-view: failed to load configuration from %s\n",
+                rc_path);
+        return 1;
+    }
+    signal(SIGINT, on_sigint);
+    // A server dying mid-send should come back as -1 from write, not kill us.
+    signal(SIGPIPE, SIG_IGN);
+
+    stateview_t v;
+    memset(&v, 0, sizeof v);
+    v.sock = -1;
+
+    char err[256];
+    if (live_connect(&cfg, room, &v, err, sizeof err) != 0){
+        fprintf(stderr, "tetrish-view: %s\n", err);
+        return 1;
+    }
+
+    initscr(); cbreak(); noecho(); keypad(stdscr, TRUE);
+    nodelay(stdscr, TRUE); set_escdelay(0); curs_set(0);
+    if (has_colors()){
+        start_color();
+        use_default_colors();
+        short fg[9] = { 0, COLOR_CYAN, COLOR_BLUE, COLOR_WHITE, COLOR_YELLOW,
+                        COLOR_GREEN, COLOR_MAGENTA, COLOR_RED, COLOR_WHITE };
+        for (int i = 1; i <= 8; i++) init_pair((short)i, fg[i], -1);
+    }
+
+    int    connected = 1, backoff = 1;
+    time_t retry_at  = 0;
+    while (!g_quit){
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(STDIN_FILENO, &rfds);
+        if (connected) FD_SET(v.sock, &rfds);
+        int maxfd = (connected && v.sock > STDIN_FILENO) ? v.sock : STDIN_FILENO;
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };   // 20 Hz redraw
+        int r = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+        if (r < 0){
+            if (errno == EINTR) continue;    // SIGINT: g_quit ends the loop
+            break;
+        }
+
+        int ch;
+        while ((ch = getch()) != ERR)
+            if (ch == 'q') g_quit = 1;
+
+        if (connected && FD_ISSET(v.sock, &rfds)){
+            if (sv_read_one_frame(&v) < 0){
+                live_drop(&v);
+                connected = 0;
+                backoff   = 1;
+                retry_at  = time(NULL) + backoff;
+            }
+        }
+
+        if (!connected && time(NULL) >= retry_at){
+            if (live_connect(&cfg, room, &v, err, sizeof err) == 0){
+                connected = 1;
+                backoff   = 1;
+            } else {
+                backoff  = backoff < 30 ? backoff * 2 : 30;
+                retry_at = time(NULL) + backoff;
+            }
+        }
+
+        char title[160];
+        if (connected)
+            snprintf(title, sizeof title, "SPECTATING %s  states %ld",
+                     room, v.states);
+        else {
+            long wait = (long)(retry_at - time(NULL));
+            snprintf(title, sizeof title,
+                     "SPECTATING %s  [DISCONNECTED - retry in %lds]",
+                     room, wait > 0 ? wait : 0);
+        }
+        sv_draw_all(&v, title, "q quit - reconnects with backoff by itself");
+    }
+
+    if (connected){
+        char path[64];
+        snprintf(path, sizeof path, "/room/%s", room);
+        sv_send_request(&v, HTTTP_METHOD_LEAVE, path, NULL, NULL, NULL);
+        tetrissh_close(v.sess);
+    }
+    live_drop(&v);
+    endwin();
+    printf("spectated %s: %ld state frames\n", room, v.states);
+    return 0;
+}
+
 int main(int argc, char **argv){
     if (argc < 2){
         fprintf(stderr,
                 "usage: %s [--verify] <log-file> [room] [player]\n"
-                "  replays a recorded session from tetrislogd's log file\n"
+                "       %s --live <rc-file> [room]\n"
+                "  replays a recorded session from tetrislogd's log file,\n"
+                "  or spectates a running room live over a secure session\n"
                 "  --verify  reconstruct without ncurses and print the result,\n"
                 "            so replay can be checked from a script or a test\n",
-                argv[0]);
+                argv[0], argv[0]);
         return 2;
     }
+    if (strcmp(argv[1], "--live") == 0){
+        if (argc < 3){
+            fprintf(stderr, "tetrish-view: --live needs an rc file\n");
+            return 2;
+        }
+        return live_main(argv[2], argc > 3 ? argv[3] : "demo");
+    }
 
-    // --verify runs the whole reconstruction headless. It exists because the
-    // interactive viewer needs a terminal, which means it cannot be exercised
-    // by an automated test, and an unverifiable replay is not worth much. This
-    // mode is what proves the recorded format actually contains enough to
-    // rebuild a game.
+    // --verify runs the whole reconstruction headless. The interactive viewer
+    // needs a terminal, so no automated test can drive it, and a replay nobody
+    // can check is not worth much. This mode is what proves the recorded format
+    // really does carry enough to rebuild a game.
     int verify = 0, argi = 1;
     if (strcmp(argv[argi], "--verify") == 0){ verify = 1; argi++; }
     if (argi >= argc){ fprintf(stderr, "tetrish-view: no log file given\n"); return 2; }
@@ -363,7 +575,8 @@ int main(int argc, char **argv){
     if (rc == -2 || g_nev == 0){
         fprintf(stderr,
                 "tetrish-view: no replayable session found in %s\n"
-                "  a session needs a SEED record, which tetrisd writes on START\n"
+                "  a session needs a seed: a SEED record (written at START) or\n"
+                "  any snapshot record, each of which re-states it\n"
                 "  try naming a room and player, e.g. %s %s roomA p7\n",
                 logpath, argv[0], logpath);
         return 1;
@@ -437,9 +650,9 @@ int main(int argc, char **argv){
 
         if (!paused && tick < last_tick){
             tick++;
-            // Advancing one tick means replaying up to it, which is O(tick)
-            // rather than O(1). At a few thousand ticks that is still far under
-            // one frame, and it keeps exactly one code path for play and seek.
+            // One tick forward means replaying up to it, so O(tick) not O(1).
+            // At a few thousand ticks that is still well under a frame, and it
+            // keeps play and seek on one code path.
             rebuild(&g, tick, &mismatches, &last_verified);
         }
 
