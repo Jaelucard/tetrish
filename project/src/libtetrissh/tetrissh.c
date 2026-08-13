@@ -1,7 +1,7 @@
-/**
- * tetrissh.c  —  libtetrissh: Secure Session Library for tetriSH
+/*
+ * tetrissh.c - libtetrissh: the secure session. Protocol lives in tetrissh.h.
  *
- * Crypto used (all via OpenSSL EVP, no deprecated low-level APIs):
+ * Crypto, all EVP, none of the deprecated low-level calls:
  *   - RAND_bytes           : nonce and session key generation
  *   - EVP_DigestSign*      : RSA-PSS signing   (server signs nonce)
  *   - EVP_DigestVerify*    : RSA-PSS verify    (client verifies nonce sig)
@@ -10,10 +10,10 @@
  *   - EVP_Encrypt* /Decrypt*: AES-256-CBC        (framed payload encryption)
  *   - X509_verify_cert     : cert chain check   (client validates server cert)
  *
- * Wire format for every message after the handshake:
+ * Every message after the handshake goes out as:
  *   [ 4-byte big-endian length ][ IV (16 bytes) ][ AES-256-CBC ciphertext ]
  *
- * The length field counts only the IV + ciphertext, not itself.
+ * The length counts the IV and ciphertext, not itself.
  *
  * Build:
  *   gcc -c tetrissh.c -I../../include $(pkg-config --cflags openssl) -o tetrissh.o
@@ -31,6 +31,8 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/time.h>   /* struct timeval, for SO_RCVTIMEO / SO_SNDTIMEO */
+#include <time.h>       /* clock_gettime(CLOCK_MONOTONIC) */
 
 /* OpenSSL */
 #include <openssl/rand.h>
@@ -43,7 +45,7 @@
 
 #include "tetrissh.h"
 
-/* ─────────────────────────── session struct ─────────────────────────────── */
+/* session struct */
 
 struct tetrissh_session {
     unsigned char session_key[TETRISSH_SESSION_KEY_LEN];
@@ -52,9 +54,9 @@ struct tetrissh_session {
     int sockfd;
 };
 
-/* ─────────────────────────── internal helpers ───────────────────────────── */
+/* internal helpers */
 
-/* Store a human-readable OpenSSL error string into sess->last_error. */
+/* Pull the last OpenSSL error out of its queue and park it in sess->last_error. */
 static void _ssl_err(tetrissh_session_t *sess, const char *context) {
     unsigned long e = ERR_get_error();
     char ssl_msg[256] = "(no OpenSSL error)";
@@ -65,44 +67,147 @@ static void _ssl_err(tetrissh_session_t *sess, const char *context) {
     fprintf(stderr, "[tetrissh] %s\n", sess->last_error);
 }
 
-/* Store a plain string into sess->last_error. */
+/* Same, for errors that have nothing to do with OpenSSL. */
 static void _err(tetrissh_session_t *sess, const char *msg) {
     snprintf(sess->last_error, sizeof(sess->last_error), "%s", msg);
     fprintf(stderr, "[tetrissh] %s\n", msg);
 }
 
+/* I/O budgets */
+
+/*
+ * Monotonic ms. CLOCK_MONOTONIC, not the wall clock, because nothing can step
+ * it: an NTP correction must not be able to extend or expire a peer's budget.
+ */
+static long long mono_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/*
+ * One time budget per logical operation (a whole handshake, or one framed
+ * message), shared by every syscall inside it.
+ *
+ * Two different waits live in here. Conflating them is a bug either way, so
+ * they get separate limits:
+ *
+ *   idle_ms    how long to wait for the peer's FIRST byte. 0 = wait forever.
+ *   budget_ms  how long the operation gets once that byte has landed.
+ *
+ * Waiting for a peer to start talking is not the same as a peer talking too
+ * slowly. A client sitting in tetrissh_recv between STATE broadcasts is idle,
+ * not stalled, and killing it for that would disconnect every player any time
+ * the server paused. The attack is a peer that sends a length header and then
+ * dribbles the body out, and budget_ms is what bounds that.
+ *
+ * Why bother with a budget instead of just the socket's own timeout:
+ * SO_RCVTIMEO and SO_SNDTIMEO expire per syscall. A recv() that times out
+ * after copying some bytes returns the short count instead of failing, so the
+ * reassembly loops below advance and call recv() again with a fresh, complete
+ * timeout. One byte per timeout period trips nothing and holds the connection
+ * forever, and since tetrisd runs these loops on its single event-loop thread,
+ * "forever" means every room on the server stops ticking. Deriving each
+ * syscall's timeout from an absolute deadline kills the reset: making progress
+ * no longer buys more time, the remaining budget only shrinks.
+ */
+typedef struct {
+    long long deadline;    /* absolute ms to finish by; 0 until the first byte */
+    int       idle_ms;
+    int       budget_ms;
+} io_budget_t;
+
+static io_budget_t io_budget(int idle_ms, int budget_ms)
+{
+    io_budget_t b;
+    b.deadline  = 0;
+    b.idle_ms   = idle_ms;
+    b.budget_ms = budget_ms;
+    return b;
+}
+
+/*
+ * Arm the socket timeout for the next syscall: idle_ms while nothing has moved
+ * yet, otherwise whatever is left of the deadline. A zero timeval means "no
+ * timeout" to the kernel, which is exactly what idle_ms == 0 wants.
+ *
+ * 0 while the operation may continue, -1 once it is out of time.
+ */
+static int io_arm(int fd, int optname, const io_budget_t *b)
+{
+    struct timeval tv;
+
+    if (b->deadline == 0) {
+        tv.tv_sec  = (time_t)(b->idle_ms / 1000);
+        tv.tv_usec = (suseconds_t)((b->idle_ms % 1000) * 1000);
+    } else {
+        long long remaining = b->deadline - mono_ms();
+        if (remaining <= 0) {
+            return -1;
+        }
+        tv.tv_sec  = (time_t)(remaining / 1000);
+        tv.tv_usec = (suseconds_t)((remaining % 1000) * 1000);
+    }
+
+    if (setsockopt(fd, SOL_SOCKET, optname, &tv, sizeof tv) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/* First byte moved, so the operation has begun. Start its clock. */
+static void io_started(io_budget_t *b)
+{
+    if (b->deadline == 0) {
+        b->deadline = mono_ms() + b->budget_ms;
+    }
+}
+
 /*
  * send_all / recv_all
  *
- * TCP is a stream protocol — a single send() or recv() call may transfer
- * fewer bytes than requested.  These wrappers loop until exactly `len`
- * bytes have been transferred or an unrecoverable error occurs.
+ * TCP is a stream, so one send() or recv() can move fewer bytes than asked.
+ * These loop until exactly `len` bytes have moved, the shared budget runs
+ * out, or something breaks.
  *
- * Returns 0 on success, -1 on error.
+ * `b` is shared across every transfer in one operation, so a length header
+ * and the body behind it are bounded together instead of each getting its own
+ * fresh allowance.
+ *
+ * 0 on success, -1 on error.
  */
-static int send_all(int fd, const void *buf, size_t len)
+static int send_all(int fd, const void *buf, size_t len, io_budget_t *b)
 {
     const unsigned char *p = buf;
     while (len > 0) {
+        if (io_arm(fd, SO_SNDTIMEO, b) != 0) {
+            return -1;
+        }
         ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
         if (n <= 0) {
             return -1;
         }
+        io_started(b);
         p += n;
         len -= (size_t)n;
     }
     return 0;
 }
 
-static int recv_all(int fd, void *buf, size_t len) {
+static int recv_all(int fd, void *buf, size_t len, io_budget_t *b) {
     unsigned char *p = buf;
     while (len > 0) {
+        if (io_arm(fd, SO_RCVTIMEO, b) != 0) {
+            return -1;
+        }
         ssize_t n = recv(fd, p, len, MSG_WAITALL);
 
         /* 0 = peer closed cleanly */
         if (n <= 0) {
             return -1;
         }
+        io_started(b);
         p   += n;
         len -= (size_t)n;
     }
@@ -112,31 +217,33 @@ static int recv_all(int fd, void *buf, size_t len) {
 /*
  * send_length_prefixed / recv_length_prefixed
  *
- * Every variable-length blob on the wire is preceded by a 4-byte
- * big-endian length field.  These helpers encode/decode that field
- * and transfer the blob in one logical operation.
+ * Every variable-length blob on the wire carries a 4-byte big-endian length
+ * in front of it. These do that field and the blob as one operation.
  *
- * recv_length_prefixed allocates a buffer for the caller; the caller
- * must free() it.  Returns NULL on any error.
+ * recv_length_prefixed mallocs for the caller, who free()s it. NULL on any
+ * error. max_len is the guard: check the declared length BEFORE allocating,
+ * or a peer gets to pick our malloc size.
  */
-static int send_length_prefixed(int fd, const unsigned char *data, size_t len) {
+static int send_length_prefixed(int fd, const unsigned char *data, size_t len,
+                                io_budget_t *b) {
     uint8_t hdr[4];
     hdr[0] = (uint8_t)(len >> 24);
     hdr[1] = (uint8_t)(len >> 16);
     hdr[2] = (uint8_t)(len >>  8);
     hdr[3] = (uint8_t)(len);
-    if (send_all(fd, hdr, 4) != 0) {
+    if (send_all(fd, hdr, 4, b) != 0) {
         return -1;
     }
-    if (send_all(fd, data, len) != 0) {
+    if (send_all(fd, data, len, b) != 0) {
         return -1;
     }
     return 0;
 }
 
-static unsigned char *recv_length_prefixed(int fd, size_t *out_len, size_t  max_len) {
+static unsigned char *recv_length_prefixed(int fd, size_t *out_len, size_t  max_len,
+                                           io_budget_t *b) {
     uint8_t hdr[4];
-    if (recv_all(fd, hdr, 4) != 0) {
+    if (recv_all(fd, hdr, 4, b) != 0) {
         return NULL;
     }
 
@@ -151,8 +258,8 @@ static unsigned char *recv_length_prefixed(int fd, size_t *out_len, size_t  max_
         return NULL;
     }
 
-    if (recv_all(fd, buf, len) != 0) { 
-        free(buf); 
+    if (recv_all(fd, buf, len, b) != 0) {
+        free(buf);
         return NULL;
     }
 
@@ -160,12 +267,11 @@ static unsigned char *recv_length_prefixed(int fd, size_t *out_len, size_t  max_
     return buf;
 }
 
-/* ─────────────────────────── crypto helpers ─────────────────────────────── */
+/* crypto helpers */
 
 /*
- * load_private_key
- * Reads a PEM private key from disk.
- * Caller must EVP_PKEY_free() the returned pointer.
+ * Reads a PEM private key off disk.
+ * Caller EVP_PKEY_free()s it. Miss that and valgrind will tell on you.
  */
 static EVP_PKEY *load_private_key(const char *path) {
     FILE *f = fopen(path, "r");
@@ -178,9 +284,8 @@ static EVP_PKEY *load_private_key(const char *path) {
 }
 
 /*
- * load_cert_file
- * Reads a PEM X.509 certificate from disk.
- * Caller must X509_free() the returned pointer.
+ * Reads a PEM X.509 cert off disk.
+ * Caller X509_free()s it.
  */
 static X509 *load_cert_file(const char *path) {
     FILE *f = fopen(path, "r");
@@ -193,9 +298,8 @@ static X509 *load_cert_file(const char *path) {
 }
 
 /*
- * cert_to_pem_bytes
- * Serialises an X509* into a heap-allocated PEM byte buffer.
- * Caller must free() the returned pointer.
+ * X509* out to a heap PEM buffer, via a memory BIO.
+ * Caller free()s the buffer; the BIO is ours and goes on every path.
  */
 static unsigned char *cert_to_pem_bytes(X509 *cert, size_t *out_len) {
     BIO *bio = BIO_new(BIO_s_mem());
@@ -223,9 +327,8 @@ static unsigned char *cert_to_pem_bytes(X509 *cert, size_t *out_len) {
 }
 
 /*
- * pem_bytes_to_cert
- * Parses a PEM byte buffer (not NUL-terminated) into an X509*.
- * Caller must X509_free() the returned pointer.
+ * The other direction: PEM bytes (NOT NUL-terminated, hence the length) to
+ * an X509*. Caller X509_free()s it.
  */
 static X509 *pem_bytes_to_cert(const unsigned char *data, size_t len) {
     BIO *bio = BIO_new_mem_buf(data, (int)len);
@@ -238,8 +341,9 @@ static X509 *pem_bytes_to_cert(const unsigned char *data, size_t len) {
 }
 
 /*
- * verify_cert_against_ca
- * Returns 1 if `cert` chains up to the CA in `ca_path`, 0 otherwise.
+ * 1 if `cert` chains up to the CA in `ca_path`, 0 otherwise. Handshake step 3.
+ * Free order below is ctx, then store, then CA, and it is that way round on
+ * purpose: the ctx borrows the store, the store holds a ref on the CA.
  */
 static int verify_cert_against_ca(X509 *cert, const char *ca_path) {
     X509 *ca = load_cert_file(ca_path);
@@ -261,12 +365,9 @@ static int verify_cert_against_ca(X509 *cert, const char *ca_path) {
 }
 
 /*
- * rsa_pss_sign
- *
- * Signs `msg_len` bytes at `msg` with `pkey` using RSA-PSS + SHA-256.
- * Writes the signature into a freshly malloc-ed buffer.
- * Caller must free() *sig.
- * Returns 0 on success, -1 on failure.
+ * RSA-PSS + SHA-256 over `msg_len` bytes at `msg`, signed with `pkey`.
+ * Signature lands in a fresh malloc; caller free()s *sig.
+ * 0 on success, -1 on failure.
  */
 static int rsa_pss_sign(EVP_PKEY *pkey, const unsigned char *msg, size_t msg_len, unsigned char **sig, size_t *sig_len) {
     EVP_MD_CTX *ctx = EVP_MD_CTX_new();
@@ -288,7 +389,7 @@ static int rsa_pss_sign(EVP_PKEY *pkey, const unsigned char *msg, size_t msg_len
         goto fail;
     }
 
-    /* First call: determine required buffer size. */
+    /* First call with a NULL buffer just asks how big the signature will be. */
     size_t needed = 0;
     if (EVP_DigestSignFinal(ctx, NULL, &needed) != 1) {
         goto fail;
@@ -299,7 +400,7 @@ static int rsa_pss_sign(EVP_PKEY *pkey, const unsigned char *msg, size_t msg_len
         goto fail;
     }
 
-    /* Second call: actually sign. */
+    /* Second call does the actual signing. */
     if (EVP_DigestSignFinal(ctx, *sig, &needed) != 1) {
         free(*sig); *sig = NULL; 
         goto fail;
@@ -315,10 +416,9 @@ fail:
 }
 
 /*
- * rsa_pss_verify
- *
- * Verifies an RSA-PSS + SHA-256 signature.
- * Returns 1 if valid, 0 if invalid, -1 on error.
+ * The verify half. Three-way return, and the caller has to respect it:
+ * 1 valid, 0 invalid, -1 something broke. Treating -1 as "not 0" would
+ * accept a bad signature whenever OpenSSL had a bad day.
  */
 static int rsa_pss_verify(EVP_PKEY *pkey, const unsigned char *msg, size_t msg_len, const unsigned char *sig, size_t sig_len) {
     EVP_MD_CTX *ctx = EVP_MD_CTX_new();
@@ -350,12 +450,12 @@ done:
 }
 
 /*
- * rsa_oaep_encrypt
+ * RSA-OAEP (SHA-256) encrypt of `plain` under the pubkey inside `cert`.
+ * Ciphertext lands in a fresh malloc; caller free()s *ct.
+ * 0 on success, -1 on failure.
  *
- * RSA-OAEP (SHA-256) encrypts `plain` with the public key inside `cert`.
- * Writes ciphertext into a freshly malloc-ed buffer.
- * Caller must free() *ct.
- * Returns 0 on success, -1 on failure.
+ * X509_get_pubkey hands back a reference, not a borrow, so pubkey gets
+ * EVP_PKEY_free()d on both paths out of here.
  */
 static int rsa_oaep_encrypt(X509 *cert, const unsigned char *plain, size_t plain_len, unsigned char **ct, size_t *ct_len) {
     EVP_PKEY *pubkey = X509_get_pubkey(cert);
@@ -376,7 +476,7 @@ static int rsa_oaep_encrypt(X509 *cert, const unsigned char *plain, size_t plain
         goto fail;
     }
 
-    /* Size query */
+    /* Size query first, same NULL-buffer trick as the signing path. */
     size_t needed = 0;
     if (EVP_PKEY_encrypt(ctx, NULL, &needed, plain, plain_len) != 1) {
         goto fail;
@@ -404,12 +504,9 @@ fail:
 }
 
 /*
- * rsa_oaep_decrypt
- *
- * RSA-OAEP (SHA-256) decrypts `ct` with `pkey`.
- * Writes plaintext into a freshly malloc-ed buffer.
- * Caller must free() *plain.
- * Returns 0 on success, -1 on failure.
+ * The unwrap half: RSA-OAEP (SHA-256) decrypt of `ct` with `pkey`.
+ * Plaintext lands in a fresh malloc; caller free()s *plain.
+ * 0 on success, -1 on failure.
  */
 static int rsa_oaep_decrypt(EVP_PKEY *pkey, const unsigned char *ct, size_t ct_len, unsigned char **plain, size_t *plain_len) {
     EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(pkey, NULL);
@@ -453,27 +550,24 @@ fail:
 }
 
 /*
- * aes256_cbc_encrypt
- *
- * AES-256-CBC encrypts `plain`.  Generates a fresh random 16-byte IV.
- * Output layout: [ IV (16 bytes) ][ ciphertext ]
- * The caller must free() *out.
- * Returns 0 on success, -1 on failure.
+ * AES-256-CBC over `plain`, with a fresh random 16-byte IV every call.
+ * Layout out: [ IV (16 bytes) ][ ciphertext ]. Caller free()s *out.
+ * 0 on success, -1 on failure.
  */
 static int aes256_cbc_encrypt(const unsigned char *key,
                                 const unsigned char *plain,    size_t plain_len,
                                 unsigned char      **out,      size_t *out_len)
 {
-    /* AES block size is always 16 bytes. */
+    /* AES block size is 16, always, whatever the key size. */
     const int IV_LEN    = 16;
     const int BLOCK_LEN = 16;
 
-    /* Worst-case ciphertext: plain_len + one full padding block. */
+    /* Worst case is plain_len plus one whole padding block. */
     size_t buf_size = IV_LEN + plain_len + BLOCK_LEN;
     *out = malloc(buf_size);
     if (!*out) return -1;
 
-    /* Generate a fresh random IV. */
+    /* IV goes at the front of the same buffer, so the receiver gets it free. */
     unsigned char *iv = *out;
     if (RAND_bytes(iv, IV_LEN) != 1) { free(*out); *out = NULL; return -1; }
 
@@ -498,11 +592,9 @@ fail:
 }
 
 /*
- * aes256_cbc_decrypt
- *
- * AES-256-CBC decrypts `data` (layout: [ IV (16) ][ ciphertext ]).
- * The caller must free() *plain.
- * Returns 0 on success, -1 on failure (bad padding counts as failure).
+ * AES-256-CBC decrypt of `data`, laid out [ IV (16) ][ ciphertext ].
+ * Caller free()s *plain.
+ * 0 on success, -1 on failure. Bad padding is a failure, not a warning.
  */
 static int aes256_cbc_decrypt(const unsigned char *key, const unsigned char *data, size_t data_len, unsigned char **plain, size_t *plain_len) {
     const int IV_LEN = 16;
@@ -514,7 +606,7 @@ static int aes256_cbc_decrypt(const unsigned char *key, const unsigned char *dat
     const unsigned char *ct = data + IV_LEN;
     size_t ct_len = data_len - IV_LEN;
 
-    *plain = malloc(ct_len);   /* plaintext is always <= ciphertext length */
+    *plain = malloc(ct_len);   /* padding only ever comes off, so this fits */
     if (!*plain) {
         return -1;
     }
@@ -548,7 +640,7 @@ fail:
     return -1;
 }
 
-/* ─────────────────────────── lifecycle ─────────────────────────────────── */
+/* lifecycle */
 
 tetrissh_session_t *tetrissh_session_alloc(void) {
     tetrissh_session_t *sess = calloc(1, sizeof(tetrissh_session_t));
@@ -569,7 +661,7 @@ void tetrissh_session_free(tetrissh_session_t *sess) {
     free(sess);
 }
 
-/* ─────────────────────────── handshake — server ─────────────────────────── */
+/* handshake, server side */
 
 int tetrissh_handshake_server(tetrissh_session_t *sess, int sockfd, const char *cert_path, const char *key_path) {
     if (!sess || sockfd < 0 || !cert_path || !key_path) {
@@ -581,14 +673,26 @@ int tetrissh_handshake_server(tetrissh_session_t *sess, int sockfd, const char *
 
     sess->sockfd = sockfd;
 
-    /* ── Step 1: receive the client nonce (TETRISSH_NONCE_LEN raw bytes) ── */
+    /*
+     * One deadline for the whole handshake, stamped before the first byte.
+     *
+     * This is the unauthenticated path. Nothing below has cost the peer more
+     * than a connect(), and tetrisd runs it on the same thread that drives
+     * every room's ticker. Bounding the operation instead of each syscall is
+     * what stops a peer dripping its 32-byte nonce out a byte at a time and
+     * stalling the whole server for as long as it feels like.
+     */
+    io_budget_t io = io_budget(TETRISSH_HANDSHAKE_TIMEOUT_MS,
+                               TETRISSH_HANDSHAKE_TIMEOUT_MS);
+
+    /* Step 1: the client nonce, 32 raw bytes, no length prefix. */
     unsigned char nonce[TETRISSH_NONCE_LEN];
-    if (recv_all(sockfd, nonce, TETRISSH_NONCE_LEN) != 0) {
+    if (recv_all(sockfd, nonce, TETRISSH_NONCE_LEN, &io) != 0) {
         _err(sess, "handshake_server: failed to receive nonce");
         return -1;
     }
 
-    /* ── Step 2: load our certificate and send it length-prefixed ────────── */
+    /* Step 2: our cert, length-prefixed. */
     X509 *cert = load_cert_file(cert_path);
     if (!cert) {
         _err(sess, "handshake_server: failed to load certificate");
@@ -604,14 +708,14 @@ int tetrissh_handshake_server(tetrissh_session_t *sess, int sockfd, const char *
         return -1;
     }
 
-    if (send_length_prefixed(sockfd, pem, pem_len) != 0) {
+    if (send_length_prefixed(sockfd, pem, pem_len, &io) != 0) {
         free(pem);
         _err(sess, "handshake_server: failed to send certificate");
         return -1;
     }
     free(pem);
 
-    /* ── Step 3: sign the nonce with RSA-PSS; send signature ─────────────── */
+    /* Step 3: RSA-PSS over their nonce, then ship the signature. */
     EVP_PKEY *privkey = load_private_key(key_path);
     if (!privkey) {
         _err(sess, "handshake_server: failed to load private key");
@@ -627,22 +731,22 @@ int tetrissh_handshake_server(tetrissh_session_t *sess, int sockfd, const char *
     }
     EVP_PKEY_free(privkey);
 
-    if (send_length_prefixed(sockfd, sig, sig_len) != 0) {
+    if (send_length_prefixed(sockfd, sig, sig_len, &io) != 0) {
         free(sig);
         _err(sess, "handshake_server: failed to send signature");
         return -1;
     }
     free(sig);
 
-    /* ── Step 4: receive RSA-OAEP-encrypted session key; decrypt it ──────── */
+    /* Step 4: the wrapped session key comes back; unwrap it. */
     size_t         enc_key_len = 0;
-    unsigned char *enc_key     = recv_length_prefixed(sockfd, &enc_key_len, 4096);
+    unsigned char *enc_key     = recv_length_prefixed(sockfd, &enc_key_len, 4096, &io);
     if (!enc_key) {
         _err(sess, "handshake_server: failed to receive encrypted session key");
         return -1;
     }
 
-    /* Reload the private key to decrypt. */
+    /* Key was freed after signing, so load it again to decrypt. */
     privkey = load_private_key(key_path);
     if (!privkey) { 
         free(enc_key); 
@@ -662,7 +766,7 @@ int tetrissh_handshake_server(tetrissh_session_t *sess, int sockfd, const char *
         return -1;
     }
 
-    /* ── Step 5: store the session key; mark session ready ───────────────── */
+    /* Step 5: keep the key, flip ready, we are encrypted from here on. */
     memcpy(sess->session_key, session_key, TETRISSH_SESSION_KEY_LEN);
     memset(session_key, 0, session_key_len);
     free(session_key);
@@ -672,7 +776,7 @@ int tetrissh_handshake_server(tetrissh_session_t *sess, int sockfd, const char *
     return 0;
 }
 
-/* ─────────────────────────── handshake — client ─────────────────────────── */
+/* handshake, client side */
 
 int tetrissh_handshake_client(tetrissh_session_t *sess, int sockfd, const char *ca_path) {
     if (!sess || sockfd < 0 || !ca_path) {
@@ -684,21 +788,30 @@ int tetrissh_handshake_client(tetrissh_session_t *sess, int sockfd, const char *
 
     sess->sockfd = sockfd;
 
-    /* ── Step 1: generate a fresh nonce and send it ───────────────────────── */
+    /*
+     * Same one-budget-per-handshake as the server side, for the mirror-image
+     * reason: a hostile or wedged server dribbling its certificate out a byte
+     * at a time would park the client in here forever, terminal already in
+     * curses mode, no way back to the input loop.
+     */
+    io_budget_t io = io_budget(TETRISSH_HANDSHAKE_TIMEOUT_MS,
+                               TETRISSH_HANDSHAKE_TIMEOUT_MS);
+
+    /* Step 1: fresh nonce, every connection, no reuse. */
     unsigned char nonce[TETRISSH_NONCE_LEN];
     if (RAND_bytes(nonce, TETRISSH_NONCE_LEN) != 1) {
         _ssl_err(sess, "handshake_client: RAND_bytes nonce failed");
         return -1;
     }
 
-    if (send_all(sockfd, nonce, TETRISSH_NONCE_LEN) != 0) {
+    if (send_all(sockfd, nonce, TETRISSH_NONCE_LEN, &io) != 0) {
         _err(sess, "handshake_client: failed to send nonce");
         return -1;
     }
 
-    /* ── Step 2: receive server certificate; parse it ────────────────────── */
+    /* Step 2: server cert arrives; parse it out of the PEM bytes. */
     size_t cert_pem_len = 0;
-    unsigned char *cert_pem = recv_length_prefixed(sockfd, &cert_pem_len, 64 * 1024);
+    unsigned char *cert_pem = recv_length_prefixed(sockfd, &cert_pem_len, 64 * 1024, &io);
     if (!cert_pem) {
         _err(sess, "handshake_client: failed to receive certificate");
         return -1;
@@ -712,16 +825,16 @@ int tetrissh_handshake_client(tetrissh_session_t *sess, int sockfd, const char *
         return -1;
     }
 
-    /* ── Step 3: verify the certificate against our CA ───────────────────── */
+    /* Step 3: does it chain to our bundled CA? If not, walk away. */
     if (!verify_cert_against_ca(server_cert, ca_path)) {
         X509_free(server_cert);
         _err(sess, "handshake_client: server certificate failed CA verification");
         return -1;
     }
 
-    /* ── Step 4: receive RSA-PSS signature; verify it against the nonce ──── */
+    /* Step 4: signature over OUR nonce, checked against the cert's pubkey. */
     size_t sig_len = 0;
-    unsigned char *sig = recv_length_prefixed(sockfd, &sig_len, 4096);
+    unsigned char *sig = recv_length_prefixed(sockfd, &sig_len, 4096, &io);
     if (!sig) {
         X509_free(server_cert);
         _err(sess, "handshake_client: failed to receive signature");
@@ -739,7 +852,7 @@ int tetrissh_handshake_client(tetrissh_session_t *sess, int sockfd, const char *
         return -1;
     }
 
-    /* ── Step 5: generate a fresh 32-byte AES session key ───────────────── */
+    /* Step 5: 32 bytes of AES key, from RAND_bytes, not rand(). */
     unsigned char session_key[TETRISSH_SESSION_KEY_LEN];
     if (RAND_bytes(session_key, TETRISSH_SESSION_KEY_LEN) != 1) {
         X509_free(server_cert);
@@ -747,7 +860,7 @@ int tetrissh_handshake_client(tetrissh_session_t *sess, int sockfd, const char *
         return -1;
     }
 
-    /* ── Step 6: RSA-OAEP encrypt the session key; send it ──────────────── */
+    /* Step 6: wrap it under the server's pubkey and send. */
     unsigned char *enc_key     = NULL;
     size_t         enc_key_len = 0;
     if (rsa_oaep_encrypt(server_cert, session_key, TETRISSH_SESSION_KEY_LEN, &enc_key, &enc_key_len) != 0) {
@@ -757,23 +870,23 @@ int tetrissh_handshake_client(tetrissh_session_t *sess, int sockfd, const char *
     }
     X509_free(server_cert);
 
-    if (send_length_prefixed(sockfd, enc_key, enc_key_len) != 0) {
+    if (send_length_prefixed(sockfd, enc_key, enc_key_len, &io) != 0) {
         free(enc_key);
         _err(sess, "handshake_client: failed to send encrypted session key");
         return -1;
     }
     free(enc_key);
 
-    /* ── Step 7: store session key; mark ready ───────────────────────────── */
+    /* Step 7: keep the key, flip ready. Handshake done. */
     memcpy(sess->session_key, session_key, TETRISSH_SESSION_KEY_LEN);
-    memset(session_key, 0, sizeof(session_key));   /* scrub stack copy */
+    memset(session_key, 0, sizeof(session_key));   /* wipe the stack copy */
 
     sess->ready = 1;
     snprintf(sess->last_error, sizeof(sess->last_error), "ok");
     return 0;
 }
 
-/* ─────────────────────────── framed send / recv ────────────────────────── */
+/* framed send / recv */
 
 int tetrissh_send(tetrissh_session_t *sess, int sockfd, const unsigned char *plaintext, size_t plain_len) {
     if (!sess || !tetrissh_is_ready(sess)) {
@@ -789,7 +902,7 @@ int tetrissh_send(tetrissh_session_t *sess, int sockfd, const unsigned char *pla
         return -1;
     }
 
-    /* Encrypt: output is [ IV (16) ][ ciphertext ] */
+    /* Encrypt first, then frame. Output is [ IV (16) ][ ciphertext ]. */
     unsigned char *frame     = NULL;
     size_t         frame_len = 0;
     if (aes256_cbc_encrypt(sess->session_key, plaintext, plain_len, &frame, &frame_len) != 0) {
@@ -797,8 +910,17 @@ int tetrissh_send(tetrissh_session_t *sess, int sockfd, const unsigned char *pla
         return -1;
     }
 
-    /* Send as length-prefixed blob. */
-    int rc = send_length_prefixed(sockfd, frame, frame_len);
+    /*
+     * Out as a length-prefixed blob, one deadline for the frame.
+     *
+     * tetrisd calls this from the room ticker, once per recipient, so a peer
+     * that stops reading backs up this socket's send buffer and blocks us
+     * right here. Without a per-operation bound, one player hitting Ctrl-Z
+     * freezes every room on the server, not just their own.
+     */
+    io_budget_t io = io_budget(TETRISSH_FRAME_TIMEOUT_MS,
+                               TETRISSH_FRAME_TIMEOUT_MS);
+    int rc = send_length_prefixed(sockfd, frame, frame_len, &io);
     free(frame);
 
     if (rc != 0) {
@@ -821,9 +943,22 @@ unsigned char *tetrissh_recv(tetrissh_session_t *sess, int sockfd, size_t *out_l
         return NULL;
     }
 
-    /* Read the encrypted frame (IV + ciphertext). */
+    /*
+     * Read the encrypted frame (IV + ciphertext).
+     *
+     * idle_ms is 0, i.e. wait as long as it takes for the frame to BEGIN. A
+     * caller sitting between STATE broadcasts is legitimately idle and must
+     * not be dropped for it. Both real callers gate this on readiness anyway
+     * (tetrisd on epoll, tetrisu on select), so the first byte is normally
+     * already there. What is bounded is everything after that first byte:
+     * once a length header has arrived, the body has TETRISSH_FRAME_TIMEOUT_MS
+     * to show up, however the peer chooses to pace it.
+     */
     size_t frame_len = 0;
-    unsigned char *frame = recv_length_prefixed(sockfd, &frame_len, TETRISSH_MAX_FRAME_LEN + 16 + 16);
+    io_budget_t io = io_budget(0, TETRISSH_FRAME_TIMEOUT_MS);
+    unsigned char *frame = recv_length_prefixed(sockfd, &frame_len,
+                                                TETRISSH_MAX_FRAME_LEN + 16 + 16,
+                                                &io);
     if (!frame) {
         _err(sess, "tetrissh_recv: failed to receive frame");
         return NULL;
@@ -845,7 +980,7 @@ unsigned char *tetrissh_recv(tetrissh_session_t *sess, int sockfd, size_t *out_l
     return plain;   /* caller must free() */
 }
 
-/* ─────────────────────────── teardown ──────────────────────────────────── */
+/* teardown */
 
 void tetrissh_close(tetrissh_session_t *sess) {
     if (!sess) {
@@ -857,7 +992,7 @@ void tetrissh_close(tetrissh_session_t *sess) {
     snprintf(sess->last_error, sizeof(sess->last_error), "session closed");
 }
 
-/* ─────────────────────────── utility ───────────────────────────────────── */
+/* utility */
 
 int tetrissh_is_ready(const tetrissh_session_t *sess) {
     return (sess && sess->ready) ? 1 : 0;
