@@ -24,31 +24,14 @@ CFLAGS   := -D_GNU_SOURCE -Wall -Wextra -g -pthread -I include -I src/libtetrisb
 # OpenSSL: libtetrissh uses the EVP API, so every binary that links it needs
 # libssl/libcrypto at the END of the link line (static .a resolution order).
 SSLLIBS  := -lssl -lcrypto
-# -lrt: POSIX message queues traditionally live in librt on Linux. Darwin has
-# no librt at all (the mq shim below stands in for it), so it is a variable.
+# -lrt: POSIX message queues traditionally live in librt on Linux, so link it.
 RTLIBS   := -lrt
-# COMPAT_OBJ is empty on Linux; the Darwin block below fills it in.
-COMPAT_OBJ :=
 
-# --- macOS ------------------------------------------------------------------
-# The tree is written against Linux kernel APIs (signalfd, epoll, timerfd,
-# POSIX mqueues). On Darwin those are emulated by src/compat/macos.c over
-# kqueue/pipes/AF_UNIX datagrams, and src/compat/include/ shadows the Linux
-# headers so the sources build unmodified. On Linux none of this is in play:
-# the -I is absent, COMPAT_OBJ stays empty, and the kernel headers win.
+# this tree targets linux kernel apis (signalfd, epoll, timerfd, mqueues)
+# and builds only inside the docker/devcontainer environment.
 UNAME_S := $(shell uname -s)
-ifeq ($(UNAME_S),Darwin)
-  # Apple ships LibreSSL headers-free; use Homebrew's OpenSSL 3.
-  OPENSSL_PREFIX := $(shell brew --prefix openssl@3 2>/dev/null)
-  ifeq ($(OPENSSL_PREFIX),)
-    $(error building on macOS needs Homebrew's openssl@3: brew install openssl@3)
-  endif
-  CFLAGS  += -I src/compat/include -I $(OPENSSL_PREFIX)/include
-  SSLLIBS := -L$(OPENSSL_PREFIX)/lib -lssl -lcrypto
-  RTLIBS  :=
-  # Literal path, not $(BUILDDIR): same immediate-expansion trap as the -I
-  # paths in CFLAGS above -- BUILDDIR is defined further down.
-  COMPAT_OBJ := build/compat/macos.o
+ifneq ($(UNAME_S),Linux)
+  $(error tetriSH builds Linux-only; open the repo in the devcontainer (or docker compose -f .devcontainer/compose.yaml) and run make there)
 endif
 # Header dependency generation, applied when compiling each .o:
 #   -MMD  emit a .d file next to the .o listing the headers that .c #includes
@@ -144,8 +127,7 @@ SAN_EXTRA_SRC_test_music := src/tetrisu/music.c
 # Every object we compile, so we can pull in its generated .d dependency file.
 BIN_OBJ := $(foreach n,$(BIN_NAMES),$(BUILDDIR)/$(n)/main.o)
 ALL_OBJ := $(SSH_OBJ) $(HTTTP_OBJ) $(BRAIN_OBJ) $(COMMON_OBJ) $(DAEMON_OBJ) \
-           $(TETRISD_OBJ) $(TETRISU_OBJ) $(VIEW_OBJ) $(BIN_OBJ) $(TEST_OBJ) \
-           $(COMPAT_OBJ)
+           $(TETRISD_OBJ) $(TETRISU_OBJ) $(VIEW_OBJ) $(BIN_OBJ) $(TEST_OBJ)
 
 .PHONY: all libs bins test test-san clean
 
@@ -186,7 +168,7 @@ $(BINDIR)/tetrish: $(BUILDDIR)/tetrish/main.o $(COMMON_OBJ)
 # keeps the build portable to older toolchains.
 # tetrisd now links all three team libraries: tetrissh (session), htttp
 # (protocol), tetrisbrain (game logic) - plus OpenSSL for tetrissh.
-$(BINDIR)/tetrisd: $(TETRISD_OBJ) $(COMMON_OBJ) $(DAEMON_OBJ) $(COMPAT_OBJ) $(LIB_SSH) $(LIB_HTTTP) $(LIB_BRAIN)
+$(BINDIR)/tetrisd: $(TETRISD_OBJ) $(COMMON_OBJ) $(DAEMON_OBJ) $(LIB_SSH) $(LIB_HTTTP) $(LIB_BRAIN)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -o $@ $^ $(SSLLIBS) $(RTLIBS)
 
@@ -206,7 +188,7 @@ $(BINDIR)/tetrisctl: $(BUILDDIR)/tetrisctl/main.o $(COMMON_OBJ) $(LIB_HTTTP)
 # render code. It also links libtetrisbrain now, for the --local path only
 # (tetrisu.c / local.h): a full offline game against an in-process tb_game,
 # no sockets, kept behind a flag so the default path is unaffected.
-$(BINDIR)/tetrisu: $(TETRISU_OBJ) $(COMMON_OBJ) $(COMPAT_OBJ) $(LIB_SSH) $(LIB_HTTTP) $(LIB_BRAIN)
+$(BINDIR)/tetrisu: $(TETRISU_OBJ) $(COMMON_OBJ) $(LIB_SSH) $(LIB_HTTTP) $(LIB_BRAIN)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -o $@ $^ $(SSLLIBS) -lncurses
 
@@ -221,7 +203,7 @@ $(BINDIR)/tetrisu: $(TETRISU_OBJ) $(COMMON_OBJ) $(COMPAT_OBJ) $(LIB_SSH) $(LIB_H
 # stream STATE frames as an ordinary late-joined participant -- unlike
 # everything else here, that is why this binary now needs libtetrissh and
 # OpenSSL too, on top of libhtttp/libtetrisbrain/ncurses.
-$(BINDIR)/tetrish-view: $(VIEW_OBJ) $(BUILDDIR)/tetrisu/net.o $(COMMON_OBJ) $(COMPAT_OBJ) $(LIB_SSH) $(LIB_HTTTP) $(LIB_BRAIN)
+$(BINDIR)/tetrish-view: $(VIEW_OBJ) $(BUILDDIR)/tetrisu/net.o $(COMMON_OBJ) $(LIB_SSH) $(LIB_HTTTP) $(LIB_BRAIN)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -o $@ $^ $(SSLLIBS) -lncurses
 
@@ -247,7 +229,7 @@ $(BUILDDIR)/tests/stub_client: $(BUILDDIR)/tests/stub_client.o $(COMMON_OBJ) $(L
 $(BUILDDIR)/tests/test_garbage: $(BUILDDIR)/tests/test_garbage.o $(LIB_BRAIN)
 	$(CC) $(CFLAGS) -o $@ $^
 
-$(BUILDDIR)/tests/garbage_send: $(BUILDDIR)/tests/garbage_send.o $(COMMON_OBJ) $(COMPAT_OBJ)
+$(BUILDDIR)/tests/garbage_send: $(BUILDDIR)/tests/garbage_send.o $(COMMON_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(RTLIBS)
 
 # Edge-case tests for the protocol library. Pure parsing, no sockets.
