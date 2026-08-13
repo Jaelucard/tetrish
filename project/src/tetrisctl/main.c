@@ -1,30 +1,27 @@
-// tetrisctl is the admin command line tool. It connects to tetrisd's control
-// socket (the ctl_path from the config file), sends a single HTTTP request,
-// prints the response body, and then exits.
+// tetrisctl is the admin command line tool. Connect to tetrisd's control
+// socket (ctl_path from the config file), send one HTTTP request, print the
+// response body, exit.
 //
-// The control plane speaks real HTTTP through libhtttp, replacing an earlier
-// placeholder line protocol. This
-// channel carries plain HTTTP text over a local AF_UNIX socket. Only
-// processes on this same machine can reach that socket, so normal filesystem
-// permissions are enough to control who can connect. That is why we do not
-// bother adding the session encryption layer here, since it would not
-// protect anything extra.
+// The control plane speaks real HTTTP through libhtttp now, in place of the
+// placeholder line protocol it started with. Plain text over a local AF_UNIX
+// socket: only processes on this machine can reach it, so filesystem
+// permissions already decide who gets to connect. Wrapping it in the session
+// encryption layer would protect nothing extra, so it does not.
 //
-// Each command below turns into a single GET request to a fixed path on
-// tetrisd. Here is what each one does.
-//   status              -> GET /status     returns counters for rooms, players, and
+// Every command is one GET to a fixed path on tetrisd:
+//   status              -> GET /status     counters for rooms, players, and
 //                                 dropped log records
-//   rooms               -> GET /rooms      lists every active room along with how many
+//   rooms               -> GET /rooms      every active room and how many
 //                                 players are in it
-//   players             -> GET /players    lists every player currently connected
-//   dropped-logs        -> GET /dropped-logs  reports log records lost inside
-//                                 tetrisd, split by cause. "ring" means the
-//                                 game path could not hand the record over
-//                                 (trylock failed, or the ring was full), so
-//                                 tetrisd is busier than the shipper. "send"
-//                                 means the shipper's sendto failed, so
-//                                 tetrislogd is dead, slow, or backed up.
-//   shutdown            -> GET /shutdown   asks the daemon to shut down gracefully
+//   players             -> GET /players    every player currently connected
+//   dropped-logs        -> GET /dropped-logs  log records lost inside tetrisd,
+//                                 split by cause. "ring" means the game path
+//                                 could not hand the record over (trylock
+//                                 failed, or the ring was full), so tetrisd is
+//                                 busier than the shipper. "send" means the
+//                                 shipper's sendto failed, so tetrislogd is
+//                                 dead, slow, or backed up.
+//   shutdown            -> GET /shutdown   ask the daemon to stop cleanly
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,9 +29,22 @@
 #include <errno.h>
 #include <signal.h>         // We ignore SIGPIPE here, because the server might close first
 #include <sys/socket.h>
+#include <sys/time.h>       // struct timeval, for the socket timeouts below
 #include <sys/un.h>
 #include "rc.h"
 #include "htttp.h"
+
+// How long to wait on the daemon before giving up.
+//
+// An admin tool must not be able to hang forever, and without this it can.
+// tetrisd puts a 2 second timeout on its side of an accepted control
+// connection, but that governs the daemon's reads, not ours. If the event loop
+// is stuck (blocked mid-broadcast to a client that stopped reading, say) it
+// never reaches accept() at all, and yet connect() still SUCCEEDS, because the
+// kernel completes it into the listen backlog. So we sit in read() with nothing
+// coming back and no timeout, and `tetrisctl shutdown` hangs quietly at the one
+// moment an operator really needs it to work.
+#define CTL_TIMEOUT_SEC 5
 
 static const char *command_to_path(const char *cmd){
     if (strcasecmp(cmd, "status")       == 0) return "/status";
@@ -46,16 +56,14 @@ static const char *command_to_path(const char *cmd){
 }
 
 int main(int argc, char **argv){
-    // The first command line argument is the path to the config file, and it
-    // defaults to .tetrishrc if we are not given one. The second argument is
-    // the command to run, and it defaults to status if we are not given one.
+    // argv[1] is the config file, .tetrishrc if not given.
+    // argv[2] is the command, status if not given.
     const char *rc_path = (argc > 1) ? argv[1] : ".tetrishrc";
     const char *command = (argc > 2) ? argv[2] : "status";
 
-    // If the daemon closes the socket while we are still writing to it, we
-    // want write() to just return -1 with errno set to EPIPE. Without this
-    // line, the operating system would instead send us a signal that kills
-    // the program outright.
+    // If the daemon closes the socket while we are still writing, we want
+    // write() to return -1 with errno EPIPE. Without this line the kernel
+    // sends a signal that kills us outright instead.
     signal(SIGPIPE, SIG_IGN);
 
     const char *path = command_to_path(command);
@@ -85,15 +93,21 @@ int main(int argc, char **argv){
     }
     strncpy(addr.sun_path, cfg.ctl_path, sizeof addr.sun_path - 1);
 
+    // Both directions, before connect. The read side is the one that matters
+    // (see CTL_TIMEOUT_SEC); the write side is there so a daemon that stopped
+    // draining its receive buffer cannot wedge us either.
+    struct timeval tv = { .tv_sec = CTL_TIMEOUT_SEC, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+
     if (connect(fd, (struct sockaddr *)&addr, sizeof addr) < 0){
         fprintf(stderr, "tetrisctl: cannot connect to %s: %s\n"
                         "  (is tetrisd running?)\n", cfg.ctl_path, strerror(errno));
         close(fd); return 1;
     }
 
-    // Step 2: build the request and send it, using libhtttp to do the work.
-    // We never build the raw HTTTP text by hand, since the library already
-    // knows how to format it correctly.
+    // Step 2: build the request and send it. libhtttp formats the wire text;
+    // we never hand-roll it here.
     htttp_builder_t b;
     htttp_builder_init_request(&b, HTTTP_METHOD_GET, path);
     size_t req_len = 0;
@@ -102,9 +116,9 @@ int main(int argc, char **argv){
     if (write(fd, req, req_len) < 0){ perror("write"); free(req); close(fd); return 1; }
     free(req);
 
-    // Step 3: read the whole response. The server closes the connection once
-    // it has sent everything, so we know we are done reading when read()
-    // returns zero bytes (EOF). After that we parse the response and print it.
+    // Step 3: read the whole response. The server closes once it has sent
+    // everything, so read() returning 0 (EOF) is how we know we are done.
+    // Then parse and print.
     char buf[16384];
     size_t got = 0;
     ssize_t n;
@@ -113,7 +127,18 @@ int main(int argc, char **argv){
         if (got >= sizeof buf - 1) break;
     }
     close(fd);
-    if (n < 0){ perror("read"); return 1; }
+    if (n < 0){
+        // A timeout gets its own message. The daemon is there (connect
+        // succeeded) but is not answering, which is a different problem from
+        // a socket nobody was ever listening on.
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            fprintf(stderr, "tetrisctl: no response from tetrisd within %d seconds\n"
+                            "  (it accepted the connection but is not servicing it;"
+                            " the event loop may be blocked)\n", CTL_TIMEOUT_SEC);
+        else
+            perror("read");
+        return 1;
+    }
 
     htttp_msg_t msg;
     htttp_err_t err = htttp_parse_response(buf, got, &msg);
@@ -128,9 +153,8 @@ int main(int argc, char **argv){
     }
     if (msg.status != HTTTP_200_OK){
         fprintf(stderr, "tetrisctl: %d %s\n", (int)msg.status, msg.reason);
-        return 1;                     // A status code outside the 2xx range means the command
-                                       // failed, so we return a non-zero exit code here. That way
-                                       // scripts calling tetrisctl can check whether it succeeded.
+        return 1;                     // Anything outside 2xx means the command failed, so exit
+                                       // non-zero and a calling script can just test $?.
     }
     return 0;
 }
