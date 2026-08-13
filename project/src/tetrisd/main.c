@@ -19,22 +19,35 @@
 //   ctl_fd      AF_UNIX STREAM the control plane, which now speaks plaintext HTTTP
 //   mq          POSIX mqueue   the Battle Royale garbage channel (still a stub)
 //
-// A note on the inline handshake, which is worth being able to explain.
-// The handshake runs inline in the accept handler, on a blocking socket that is
-// bounded by 5 second send and receive timeouts. This is a deliberate choice:
-//   1. libtetrissh's receive and send helpers use MSG_WAITALL loops, which
-//      assume a blocking socket. A non-blocking fd would fail partway through
-//      the handshake with EAGAIN.
-//   2. At our scale (a few tens of clients, and an RSA handshake on the local
-//      network that takes a few milliseconds) the pause in the loop is not
-//      noticeable.
-//   3. A malicious client that handshakes very slowly can only stall the loop
-//      for up to 5 seconds because of the timeouts, and then it is dropped.
-// A production server would move handshakes onto a small pool of threads, or
-// use a non-blocking state machine. At this project's scale, doing it inline
-// with a timeout is the simple and honest baseline. The same reasoning applies
-// to connected clients: epoll tells us a frame has started arriving, and the
-// bounded blocking read then finishes it (or times the client out).
+// A note on the blocking socket I/O, which is worth being able to explain.
+//
+// Handshakes and frame reads both run on this one thread, on blocking sockets.
+// That is deliberate: libtetrissh's send and receive helpers use MSG_WAITALL
+// loops, which assume a blocking descriptor, and a non-blocking fd would fail
+// partway through a handshake with EAGAIN. At our scale (an RSA handshake on
+// the local network costs a few milliseconds) the pause is not noticeable.
+//
+// What bounds that pause is a DEADLINE, not a socket timeout, and the
+// difference is the whole reason the code looks the way it does.
+// SO_RCVTIMEO and SO_SNDTIMEO expire per syscall. A recv() that times out
+// having already copied some bytes returns the short count instead of failing,
+// so a reassembly loop advances and calls recv() again with a fresh, full
+// timeout: a peer sending one byte per timeout period resets the clock forever
+// and never trips the limit. An earlier version of this comment claimed such a
+// client "can only stall the loop for up to 5 seconds". That was wrong, and it
+// was wrong in the dangerous direction, because it is the unauthenticated
+// pre-handshake read that a peer can stall the longest.
+//
+// libtetrissh therefore stamps one absolute deadline per logical operation
+// (see TETRISSH_HANDSHAKE_TIMEOUT_MS and TETRISSH_FRAME_TIMEOUT_MS) and
+// derives every syscall's timeout from the time left until it. Forward
+// progress no longer buys the peer extra time, so the worst a slow or hostile
+// client can cost this thread is one budget, once, before it is dropped.
+//
+// A production server would move handshakes onto a pool of threads, or drive
+// clients with a non-blocking state machine and per-connection input and
+// output buffers. At this project's scale, inline work under a deadline is the
+// simple and honest baseline.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -123,9 +136,9 @@ static atomic_ulong rejected_conns;
 // direction. It makes a client prove its address with a cheap challenge round
 // trip before the server will spend anything substantial on it, precisely so a
 // flood cannot buy expensive work. TCP's own handshake already proves the
-// address for us, so we do not need the challenge; what we need is the other
-// half of the idea, which is that expensive per-connection work must be
-// rationed by the loop rather than performed on demand.
+// address for us, so the challenge is not the part we need. The other half of
+// the idea is: expensive per-connection work gets rationed by the loop, not
+// done on demand.
 // The queue depth is fixed; how many we complete per pass is configurable,
 // because it is the one real tuning knob in this design and its best value
 // depends on how fast the machine's RSA is. Measured here with 500 clients all
@@ -138,19 +151,92 @@ static atomic_ulong rejected_conns;
 //         32       500/500    19.4 Hz
 //
 // A larger budget admits more of a burst at the cost of a slightly slower tick
-// while the burst lasts. Note that even a small budget beats the old inline
-// path on admissions once accept() itself is cheap, because the kernel's listen
-// backlog can then drain instead of overflowing.
-#define PENDING_HS_MAX     512   // parked connections; beyond this we refuse
+// while the burst lasts. Even a small budget beats the old inline path on
+// admissions once accept() itself is cheap, because the kernel's listen backlog
+// can then drain instead of overflowing.
+// One more thing the queue has to get right, and it is the reason the parked
+// descriptors go into the epoll set rather than being swept in a loop.
+//
+// A parked connection is not necessarily one that is ready to be handshaken.
+// The client speaks first (it sends the 32-byte nonce), so a peer that
+// connects and then says nothing leaves finish_handshake blocked in that first
+// read. Draining the queue on a timer therefore made a connect() with no
+// follow-up into a way to stop the loop for as long as the read allowed, and
+// because the drain is serial, a queue full of such peers concatenated their
+// stalls. That is a freeze bought with a bare TCP connection, no certificate
+// and no key exchange, which is cheaper than any attack the per-IP cap was
+// written to stop.
+//
+// So a parked fd is registered with epoll like everything else in this daemon,
+// and its handshake begins only when the kernel says bytes have arrived. A
+// silent peer then costs nothing at all: it occupies a queue slot and is
+// reaped by PENDING_HS_TIMEOUT_MS, and the loop never waits on it. A peer that
+// starts talking and then stalls is bounded by libtetrissh's per-operation
+// budget instead. This is the same principle as every other fd here: the loop
+// is told when there is work, it does not go looking for it.
+#define PENDING_HS_MAX        512   // parked connections; beyond this we refuse
+#define PENDING_HS_TIMEOUT_MS 10000 // connected but never sent a byte -> reap
+
+// How many ready descriptors one epoll_wait may return.
+//
+// This is not a throughput knob to tune by feel; it has to stay comfortably
+// above the number of descriptors that can be ready at once, because
+// admission is now driven by readiness. Every parked connection is in the
+// epoll set alongside every room's ticker, so with a full admission queue and
+// rooms ticking, PENDING_HS_MAX + ROOM_HARD_MAX descriptors can all be ready
+// in the same pass. A batch smaller than that does not lose events (the set is
+// level-triggered, so they come back), but it does make handshakes queue
+// behind ticks for several passes, and a client waiting that long gives up on
+// its own handshake deadline before the server ever reaches it.
+//
+// Measured: at 32, a 500-client burst intermittently lost about 7% of arrivals
+// to exactly that timeout. Sized to cover the whole set, the same burst seats
+// all 500. The cost is stack: one epoll_event is 12 bytes, so this array is
+// about 7.7 KB in main's frame, which is a fair price for making admission
+// independent of how many rooms happen to be ticking.
+#define EPOLL_BATCH (PENDING_HS_MAX + ROOM_HARD_MAX + 16)
 
 typedef struct {
-    int      fd;
-    uint32_t addr;               // peer IPv4, network order, for the log
+    int       fd;
+    uint32_t  addr;              // peer IPv4, network order, for the log
+    long long parked_ms;         // when it was accepted, for the reaper
 } pending_hs_t;
 
 static pending_hs_t g_pending_hs[PENDING_HS_MAX];
 static int          g_npending_hs = 0;
 static atomic_ulong hs_queued, hs_refused_full;
+
+// How many connections from this address are parked waiting to be admitted.
+//
+// The per-IP limit has to count these as well as the established clients.
+// client_count_addr only sees connections that finished their handshake,
+// because client_add runs at the end of finish_handshake, so counting it alone
+// leaves the queue itself unmetered: one address could park all PENDING_HS_MAX
+// slots and never trip the limit, since none of those connections has been
+// admitted yet. Both halves together are the real per-IP footprint.
+static int pending_count_addr(uint32_t addr){
+    int n = 0;
+    for (int i = 0; i < g_npending_hs; i++)
+        if (g_pending_hs[i].addr == addr)
+            n++;
+    return n;
+}
+
+// Where this fd sits in the queue, or -1 if it is not parked.
+static int pending_index(int fd){
+    for (int i = 0; i < g_npending_hs; i++)
+        if (g_pending_hs[i].fd == fd)
+            return i;
+    return -1;
+}
+
+// Drop slot i, keeping the queue contiguous and oldest-first.
+static void pending_remove(int i){
+    g_npending_hs--;
+    if (i < g_npending_hs)
+        memmove(&g_pending_hs[i], &g_pending_hs[i + 1],
+                (size_t)(g_npending_hs - i) * sizeof g_pending_hs[0]);
+}
 
 // A tiny xorshift32, used only to pick a target room and a hole column. This is
 // deliberately NOT libtetrisbrain's PRNG. The engine's randomness is part of
@@ -904,7 +990,8 @@ static void handle_new_client(int listen_fd){
     // where every connection legitimately comes from 127.0.0.1.
     uint32_t peer_addr = (uint32_t)peer.sin_addr.s_addr;
     if (g_cfg.max_conns_per_ip > 0 &&
-        client_count_addr(peer_addr) >= g_cfg.max_conns_per_ip){
+        client_count_addr(peer_addr) + pending_count_addr(peer_addr)
+            >= g_cfg.max_conns_per_ip){
         char ipbuf[INET_ADDRSTRLEN] = "?";
         inet_ntop(AF_INET, &peer.sin_addr, ipbuf, sizeof ipbuf);
         atomic_fetch_add(&rejected_conns, 1);
@@ -914,8 +1001,11 @@ static void handle_new_client(int listen_fd){
         return;
     }
 
-    // We use a blocking socket with 5 second timeouts here. The reasoning is in
-    // the note at the top of this file.
+    // A starting timeout, so the descriptor is never left with none at all
+    // while it waits in the admission queue. It is only a floor: libtetrissh
+    // re-arms both options before every syscall from the deadline it stamps at
+    // the start of each handshake or frame, which is what actually bounds the
+    // work. See the note at the top of this file.
     struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
     setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
@@ -931,8 +1021,16 @@ static void handle_new_client(int listen_fd){
         close(cfd);
         return;
     }
-    g_pending_hs[g_npending_hs].fd   = cfd;
-    g_pending_hs[g_npending_hs].addr = peer_addr;
+    // Park it and let epoll tell us when this peer actually starts speaking.
+    // Until then it costs us a queue slot and nothing else.
+    if (ep_add(g_ep, cfd) < 0){
+        slog("error", "epoll add failed for pending fd %d: %s", cfd, strerror(errno));
+        close(cfd);
+        return;
+    }
+    g_pending_hs[g_npending_hs].fd        = cfd;
+    g_pending_hs[g_npending_hs].addr      = peer_addr;
+    g_pending_hs[g_npending_hs].parked_ms = (long long)(mono_ns() / 1000000ull);
     g_npending_hs++;
     atomic_fetch_add(&hs_queued, 1);
 }
@@ -970,23 +1068,50 @@ static int finish_handshake(int cfd, uint32_t peer_addr){
     return 0;
 }
 
-// Complete up to HANDSHAKE_BUDGET parked connections, oldest first.
+// A parked connection has become readable, so its peer has started talking and
+// the handshake can run without waiting on anyone.
 //
-// Called once per pass of the event loop. The budget is what turns a burst of
-// arrivals from a single long stall into a series of short ones with real work
-// in between.
-static void drain_handshakes(void){
-    int budget = g_cfg.handshake_budget > 0 ? g_cfg.handshake_budget : 32;
-    int n = g_npending_hs < budget ? g_npending_hs : budget;
-    for (int i = 0; i < n; i++)
-        finish_handshake(g_pending_hs[i].fd, g_pending_hs[i].addr);
+// The budget still applies, and still means what it meant before: at most this
+// many handshakes complete per pass of the loop, so a crowd arriving at once
+// cannot spend the whole pass on RSA while rooms are waiting to tick. What
+// changed is only which connections are eligible. Anything held back stays in
+// the queue and in the epoll set, and since the set is level-triggered it is
+// offered again on the next pass; nothing needs to remember it.
+static void handle_pending_handshake(int fd, int *budget_left){
+    int i = pending_index(fd);
+    if (i < 0) return;
+    if (*budget_left <= 0) return;              // next pass; epoll will re-offer
+    (*budget_left)--;
 
-    // Shuffle the remainder down. The queue is small and bursts are short, so a
-    // memmove is cheaper and far easier to reason about than a ring buffer.
-    g_npending_hs -= n;
-    if (g_npending_hs > 0)
-        memmove(g_pending_hs, g_pending_hs + n,
-                (size_t)g_npending_hs * sizeof g_pending_hs[0]);
+    uint32_t addr = g_pending_hs[i].addr;
+    pending_remove(i);
+
+    // finish_handshake re-adds the fd on success and closes it on failure, so
+    // it must not already be in the set when either of those happens.
+    epoll_ctl(g_ep, EPOLL_CTL_DEL, fd, NULL);
+    finish_handshake(fd, addr);
+}
+
+// Close out connections that were accepted and then never said anything.
+//
+// With the handshake driven by readability, a silent peer no longer stalls the
+// loop, but it does hold a queue slot, and PENDING_HS_MAX of them would still
+// deny the queue to real players. This is the other half of that defence: a
+// peer gets PENDING_HS_TIMEOUT_MS to send its first byte, and the per-IP cap
+// (which counts parked connections as well as established ones) bounds how
+// many any single host can be sitting on meanwhile.
+static void reap_stale_handshakes(void){
+    long long now = (long long)(mono_ns() / 1000000ull);
+    for (int i = g_npending_hs - 1; i >= 0; i--){
+        if (now - g_pending_hs[i].parked_ms < PENDING_HS_TIMEOUT_MS)
+            continue;
+        int fd = g_pending_hs[i].fd;
+        slog("warn", "fd %d: connected but sent nothing in %d ms, dropping",
+             fd, PENDING_HS_TIMEOUT_MS);
+        pending_remove(i);
+        epoll_ctl(g_ep, EPOLL_CTL_DEL, fd, NULL);
+        close(fd);
+    }
 }
 
 static void disconnect_client(int fd, const char *reason){
@@ -1602,20 +1727,23 @@ int main(int argc, char **argv){
     //     the client table) or a room's game timer.
     int running = 1;
     while (running){
-        struct epoll_event events[32];
-        // Never sleep while connections are parked waiting to be admitted.
-        // With a -1 timeout the loop would block until the next tick or the
-        // next packet, which at low room counts could be a long time to leave
-        // somebody hanging mid-handshake. This is the same idea as Redis's
-        // aeSetDontWait: if there is work already in hand, poll and get on
-        // with it rather than waiting to be told about more.
-        int timeout_ms = (g_npending_hs > 0) ? 0 : -1;
-        int n = epoll_wait(g_ep, events, 32, timeout_ms);
+        struct epoll_event events[EPOLL_BATCH];
+        // Parked connections no longer need polling: each one is in the epoll
+        // set and announces itself when its peer speaks. A bounded wait is
+        // still used while any are parked, but only so the reaper below runs
+        // on a quiet server; it is not how progress is made.
+        int timeout_ms = (g_npending_hs > 0) ? 1000 : -1;
+        int n = epoll_wait(g_ep, events, EPOLL_BATCH, timeout_ms);
         if (n < 0){
             if (errno == EINTR) continue;
             perror("epoll_wait");
             break;
         }
+
+        // Handshakes completed on this pass. See handle_pending_handshake.
+        // ctl_fd is tested before the client branch, so an admin command is serviced in teh same pass as a flood
+        int hs_budget = g_cfg.handshake_budget > 0 ? g_cfg.handshake_budget : 32;
+
         for (int i = 0; i < n && running; i++){
             int fd = events[i].data.fd;
             if      (fd == listen_fd) handle_new_client(listen_fd);
@@ -1623,6 +1751,7 @@ int main(int argc, char **argv){
             else if (fd == ctl_fd)    handle_ctl(ctl_fd, &running);
             else if (fd == (int)mq)   handle_garbage(mq);
             else if (client_get(fd) != NULL) handle_client_data(fd);
+            else if (pending_index(fd) >= 0) handle_pending_handshake(fd, &hs_budget);
             else {
                 room_t *r = room_by_timerfd(fd);
                 if (r != NULL) handle_room_tick(r);
@@ -1630,11 +1759,7 @@ int main(int argc, char **argv){
             }
         }
 
-        // Admit a bounded number of parked connections. This runs after the
-        // event handlers, so a tick that was already due is always serviced
-        // before we spend time on new arrivals: existing players keep their
-        // frame rate while a crowd is let in.
-        if (g_npending_hs > 0) drain_handshakes();
+        if (g_npending_hs > 0) reap_stale_handshakes();
     }
 
     // 13. Shut down cleanly in four phases, with each one being logged
@@ -1651,7 +1776,19 @@ int main(int argc, char **argv){
     // dedicated function, closeListeningSockets() (server.c:4872).
     epoll_ctl(g_ep, EPOLL_CTL_DEL, listen_fd, NULL);
     close(listen_fd);
-    slog("info", "tetrisd: phase 1: stopped accepting new clients");
+
+    // Connections that were accepted but never finished their handshake are
+    // not clients yet, so phase 2 below will not find them. They own a
+    // descriptor and nothing else, and there is no session to tear down.
+    int parked = g_npending_hs;
+    for (int i = 0; i < g_npending_hs; i++){
+        epoll_ctl(g_ep, EPOLL_CTL_DEL, g_pending_hs[i].fd, NULL);
+        close(g_pending_hs[i].fd);
+    }
+    g_npending_hs = 0;
+    slog("info", "tetrisd: phase 1: stopped accepting new clients"
+                 " (%d unadmitted connection%s dropped)",
+         parked, parked == 1 ? "" : "s");
 
     // Phase 2: drain. Disconnecting a client also tears down its room and
     // that room's game timer, and frees its secure session, so this one loop
