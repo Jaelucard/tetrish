@@ -65,6 +65,7 @@
 #include "rc.h"
 #include "htttp.h"
 #include "local.h"
+#include "music.h"
 #include "net.h"
 
 #define VIEW_ROWS   NET_VIEW_ROWS
@@ -83,6 +84,7 @@
 
 static net_ctx  g_net;
 static int      g_curses_up = 0;
+static music_t  g_music;         // zeroed static: music_stop is safe before music_start
 
 // Registered with atexit BEFORE curses starts, so every exit path restores the
 // terminal, including ones that have not been written yet. jserv's tetris does
@@ -94,7 +96,10 @@ static void restore_terminal(void){
 
 // Fail with the terminal already restored, so the message is readable and the
 // shell survives. Never call exit() directly once curses owns the screen.
+// Also the one funnel every fatal path passes through, so stopping the music
+// child here covers handshake/JOIN/START failures after music has started.
 static void die(const char *fmt, const char *arg){
+    music_stop(&g_music);
     restore_terminal();
     fprintf(stderr, "tetrisu: ");
     fprintf(stderr, fmt, arg);
@@ -189,7 +194,7 @@ static void draw_all(const net_ctx *net, const char *room, int connected){
     int f = board_top + VIEW_ROWS + 3;
     if (f < LINES)
         mvprintw(f, BOARD_LEFT,
-                 "left/right move - down soft - space hard - up/x rot cw - z ccw - q quit");
+                 "left/right move - down soft - space hard - up/x rot - z ccw - m music - q quit");
 
     // One doupdate per frame rather than a refresh per element, so the screen
     // updates atomically and never tears between boards.
@@ -247,14 +252,21 @@ int main(int argc, char **argv){
         die("failed to load configuration from %s", rc_path);
 
     // Block SIGINT and take it as a readable descriptor instead. This has to
-    // happen before anything else can be interrupted.
+    // happen before anything else can be interrupted. SIGCHLD rides the same
+    // signalfd: it is blocked BEFORE the music child is forked, so its exit
+    // can never be missed, only parked until the loop reads the descriptor.
     sigset_t mask;
     sigemptyset(&mask);
     sigaddset(&mask, SIGINT);
     sigaddset(&mask, SIGTERM);
+    sigaddset(&mask, SIGCHLD);
     if (sigprocmask(SIG_BLOCK, &mask, NULL) < 0) die("sigprocmask: %s", strerror(errno));
     int sigfd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
     if (sigfd < 0) die("signalfd: %s", strerror(errno));
+
+    // Background music, strictly off the critical path: any failure prints
+    // one line (curses is not up yet) and the game continues in silence.
+    music_start(&g_music);
 
     if (net_connect_and_handshake(&cfg, &g_net) != 0){
         // Copy the reason out BEFORE net_close: tetrissh_strerror returns a
@@ -339,9 +351,15 @@ int main(int argc, char **argv){
 
         // Independent ifs, never else-if. At 20 Hz the socket is ready on
         // almost every frame, and an else-if chain would starve the keyboard.
+        // Drained in a loop (the fd is non-blocking): SIGCHLD means the music
+        // player finished a pass and gets respawned so the tune repeats;
+        // anything else on this descriptor is a request to quit.
         if (FD_ISSET(sigfd, &rfds)){
             struct signalfd_siginfo si;
-            if (read(sigfd, &si, sizeof si) == (ssize_t)sizeof si) running = 0;
+            while (read(sigfd, &si, sizeof si) == (ssize_t)sizeof si){
+                if (si.ssi_signo == SIGCHLD) music_on_sigchld(&g_music);
+                else                         running = 0;
+            }
         }
 
         if (FD_ISSET(STDIN_FILENO, &rfds)){
@@ -366,6 +384,9 @@ int main(int argc, char **argv){
                 // No 180/hold/pause here: the wire protocol carries only
                 // MOVE/ROTATE/DROP, and a server-authoritative multiplayer
                 // room cannot pause for one player. Local mode has them all.
+                // m is handled entirely client-side: body stays NULL, so the
+                // keypress is never forwarded to the server as a game input.
+                case 'm': case 'M': music_toggle(&g_music); break;
                 case 'q': case 'Q': running = 0; break;
                 default: break;                       // ERR and unknown keys
                 }
@@ -385,6 +406,7 @@ int main(int argc, char **argv){
         draw_all(&g_net, room, connected);
     }
 
+    music_stop(&g_music);
     if (connected)
         net_send_action(&g_net, HTTTP_METHOD_LEAVE, path, NULL);
     net_close(&g_net);

@@ -213,3 +213,41 @@ the repl command path.
 every call, since it can now run more than once in the same process (a
 repl session issuing `replay` twice) rather than exactly once per process
 lifetime as it was when replay was the entire program.
+
+## Background music (tetrisu)
+
+`src/tetrisu/music.c` synthesizes the Korobeiniki melody -- the Russian
+folk tune associated with Tetris -- into a temp WAV at startup. The tune
+itself is public domain; what remains copyrighted are *recordings* and
+*arrangements* of it (notably the Game Boy version, which is Nintendo's
+arrangement). So the note tables here were written by hand from the
+well-known melody and its traditional A-minor harmonization: a 25%-duty
+square melody voice over a root-fifth 50%-duty bass, imitating the era's
+sound in character only. No audio file, MIDI, or existing transcription
+was copied. Only the A-section is included, on repeat, per the team's
+choice.
+
+Playback is a player subprocess, not an audio library: `music_start`
+writes the WAV via `mkstemp` and forks a child that execvp's the first
+of `aplay`/`afplay`/`paplay` that exists, with all three stdio fds on
+`/dev/null`. Looping is respawn-on-exit -- the child plays one 19.2 s
+pass and exits, SIGCHLD arrives on the client's existing signalfd (it
+rides the same descriptor as SIGINT/SIGTERM, blocked before the first
+fork so an exit can never be missed), and the select() loop respawns it.
+No threads, no timers, no new dependencies, and `waitpid` is only ever
+called with `WNOHANG`.
+
+Every failure mode degrades to silence: no player installed (the child
+`_exit(127)`s and is not respawned), no audio device (a child that dies
+within 2 s disables music for the session -- also the guard against a
+respawn storm), `/tmp` not writable, or fork failure. At most one line
+goes to stderr, and only before curses starts. `m` toggles mute (kill
+the child, keep the WAV; unmute respawns). Every exit path -- quit key,
+SIGINT/SIGTERM, server disconnect, and the `die()` funnel that all
+post-start fatal errors pass through -- calls the idempotent
+`music_stop`, so no orphan player and no leftover temp file.
+
+Music lives client-side only: the server is authoritative over the game,
+but sound is presentation, exactly like colors and box-drawing -- the
+brain and the wire protocol know nothing about it, which is also what
+keeps the 20k-tick determinism contract untouched.

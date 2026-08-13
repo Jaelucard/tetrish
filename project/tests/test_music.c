@@ -1,7 +1,8 @@
 // unit test for the music synthesizer: generates the wav via
 // music_write_wav, reads the file back, and checks the riff header
-// fields, the exact data size against the note table, and that every
-// sample is one of {+MUSIC_AMP, -MUSIC_AMP, 0}. headless and
+// fields, the exact data size against the note tables, that the melody
+// and bass tables agree on total duration, and that every sample stays
+// inside the mixed two-voice amplitude budget. headless and
 // deterministic; the temp file is unlinked at the end.
 
 #include <assert.h>
@@ -63,38 +64,57 @@ int main(void)
     assert(data_bytes == (uint32_t)fsz - 44);
     assert(get_u32(buf + 4) == (uint32_t)fsz - 8);
 
-    // test 4. total duration equals the note table durations plus one
-    // articulation gap per note, using the same integer rounding as the
-    // synthesizer (per-note truncation, so exact, not just within one
-    // sample).
-    uint32_t gap = (uint32_t)MUSIC_GAP_MS * MUSIC_RATE_HZ / 1000;
+    // test 4. total duration equals the melody table's durations using
+    // the same integer arithmetic as the synthesizer (every table
+    // duration is a multiple of 200 ms, which divides exactly at 22050
+    // hz, so this is exact, not just within one sample). the bass table
+    // must agree, or the voices would drift apart.
     uint32_t expect = 0;
     for (size_t i = 0; i < music_melody_len; i++)
-        expect += (uint32_t)music_melody[i].dur_ms * MUSIC_RATE_HZ / 1000 + gap;
+        expect += (uint32_t)music_melody[i].dur_ms * MUSIC_RATE_HZ / 1000;
+    uint32_t bass_total = 0;
+    for (size_t i = 0; i < music_bass_len; i++)
+        bass_total += (uint32_t)music_bass[i].dur_ms * MUSIC_RATE_HZ / 1000;
+    assert(bass_total == expect);
     assert(data_bytes == expect * 2);
 
-    // test 5. every sample is +amp, -amp, or silence, and both wave
-    // polarities plus silence actually occur.
+    // test 5. every sample stays inside the mixed amplitude budget, and
+    // both polarities plus true silence actually occur.
+    int32_t budget = MUSIC_AMP_MELODY + MUSIC_AMP_BASS;
     uint32_t n_pos = 0, n_neg = 0, n_zero = 0;
     for (uint32_t s = 0; s < expect; s++) {
         int16_t v = (int16_t)get_u16(buf + 44 + (size_t)s * 2);
-        assert(v == MUSIC_AMP || v == -MUSIC_AMP || v == 0);
+        assert(v >= -budget && v <= budget);
         if (v > 0) n_pos++;
         else if (v < 0) n_neg++;
         else n_zero++;
     }
     assert(n_pos > 0 && n_neg > 0 && n_zero > 0);
 
-    // test 6. the table itself looks like the melody: starts on e5, has
-    // a sane size, and contains rests.
-    assert(music_melody_len >= 40 && music_melody_len <= 60);
+    // test 6. the tables themselves look like the tune: the melody
+    // starts on e5, both tables have sane sizes, the melody contains
+    // rests, and every frequency is 0 or in the playable band.
+    assert(music_melody_len >= 40 && music_melody_len <= 128);
+    assert(music_bass_len >= 32 && music_bass_len <= 192);
     assert(music_melody[0].freq_hz == 659);
+    uint32_t n_rest = 0;
+    for (size_t i = 0; i < music_melody_len; i++) {
+        uint16_t fq = music_melody[i].freq_hz;
+        assert(fq == 0 || (fq >= 60 && fq <= 1000));
+        if (fq == 0) n_rest++;
+    }
+    assert(n_rest > 0);
+    for (size_t i = 0; i < music_bass_len; i++) {
+        uint16_t fq = music_bass[i].freq_hz;
+        assert(fq == 0 || (fq >= 60 && fq <= 1000));
+    }
 
     free(buf);
     assert(unlink(path) == 0);
 
-    printf("test_music: %zu notes, %u samples (%u ms), all checks passed\n",
-           music_melody_len, expect,
+    printf("test_music: %zu melody + %zu bass notes, %u samples (%u ms), "
+           "all checks passed\n",
+           music_melody_len, music_bass_len, expect,
            (unsigned)((uint64_t)expect * 1000 / MUSIC_RATE_HZ));
     return 0;
 }

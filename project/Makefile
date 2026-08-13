@@ -269,7 +269,14 @@ $(BUILDDIR)/tests/test_control: tests/test_control.c tests/mocks/mock_control.c 
 
 # Sanitized tests (auto-discovered above): $* is the stem (e.g. test_brain),
 # so SAN_EXTRA_SRC_$* pulls in that test's companion source, if any.
-$(BUILDDIR)/tests-san/%: tests/%.c $(SAN_EXTRA_SRC_$*)
+# .SECONDEXPANSION with $$: automatic variables like $* are NOT set while
+# make expands a prerequisite list the first time, so a plain
+# $(SAN_EXTRA_SRC_$*) there silently expanded to nothing -- the companion
+# source was compiled in by the recipe but never tracked as a dependency,
+# and editing it left a stale test binary. The doubled $$ defers expansion
+# to the second pass, where $* exists.
+.SECONDEXPANSION:
+$(BUILDDIR)/tests-san/%: tests/%.c $$(SAN_EXTRA_SRC_$$*)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(SANFLAGS) -o $@ $< $(SAN_EXTRA_SRC_$*)
 
