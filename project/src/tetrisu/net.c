@@ -134,10 +134,25 @@ static void parse_state(net_ctx *ctx, const char *body, size_t len){
             line[cp] = '\0';
             n++;
             board_t *b = &tmp[n - 1];
-            // A short read here just leaves the tail zeroed; the block is still
-            // usable for drawing, which matters more than rejecting it.
-            sscanf(line, "player %31s score %u level %u lines %u over %d",
-                   b->id, &b->score, &b->level, &b->lines, &b->over);
+            // -1 BEFORE the parse, not after: the memset above zeroes these,
+            // and 0 is a real piece type (the O piece). A header that stops
+            // early -- an older server, a truncated line -- would otherwise
+            // leave the previews reading as "O" and draw two blocks that do
+            // not exist. -1 is the only value that means "nothing to draw".
+            b->next = b->hold = -1;
+            b->held = 0;
+            // A short read here just leaves the tail at those defaults; the
+            // block is still usable for drawing, which matters more than
+            // rejecting it.
+            sscanf(line, "player %31s score %u level %u lines %u over %d "
+                         "next %d hold %d held %d",
+                   b->id, &b->score, &b->level, &b->lines, &b->over,
+                   &b->next, &b->hold, &b->held);
+            // Everything above came off the network, so the previews are
+            // clamped to the piece-type range before anything indexes
+            // tb_positions with them.
+            if (b->next < 0 || b->next >= TB_NUM_PIECES) b->next = -1;
+            if (b->hold < 0 || b->hold >= TB_NUM_PIECES) b->hold = -1;
         } else if (n > 0 && linelen > 0){
             board_t *b = &tmp[n - 1];
             if (b->rows_filled < NET_VIEW_ROWS){

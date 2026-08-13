@@ -365,6 +365,8 @@ static const char *input_name(tb_input in){
     case TB_INPUT_ROTATE_CCW: return "ROTATE_CCW";
     case TB_INPUT_SOFT_DROP: return "SOFT";
     case TB_INPUT_HARD_DROP: return "HARD";
+    case TB_INPUT_ROTATE_180: return "ROTATE_180";
+    case TB_INPUT_HOLD:      return "HOLD";
     default:                 return "NONE";
     }
 }
@@ -816,8 +818,14 @@ static int do_start(client_t *c, const char *rid){
     return send_response(c, HTTTP_200_OK, "{\"ok\": true}", NULL);
 }
 
-// Map a MOVE/ROTATE/DROP body onto a tetrisbrain input. -1 = invalid body.
+// Map a MOVE/ROTATE/DROP/HOLD request onto a tetrisbrain input.
+// -1 = invalid body.
+//
+// HOLD is checked before the body test because it is the one input that
+// carries no body at all: the method IS the whole instruction, so requiring
+// a body would reject every well-formed HOLD.
 static int map_input(htttp_method_t m, const char *body, size_t blen){
+    if (m == HTTTP_METHOD_HOLD) return TB_INPUT_HOLD;
     if (body == NULL) return -1;
     if (m == HTTTP_METHOD_MOVE){
         if (blen == 4 && strncmp(body, "LEFT", 4)  == 0) return TB_INPUT_LEFT;
@@ -828,6 +836,9 @@ static int map_input(htttp_method_t m, const char *body, size_t blen){
         // first keeps the two cases from ever being confused.
         if (blen == 3 && strncmp(body, "CCW", 3) == 0) return TB_INPUT_ROTATE_CCW;
         if (blen == 2 && strncmp(body, "CW", 2)  == 0) return TB_INPUT_ROTATE_CW;
+        // A third body rather than a third method: 180 is a rotation, and the
+        // brain has always had TB_INPUT_ROTATE_180 for it.
+        if (blen == 3 && strncmp(body, "180", 3) == 0) return TB_INPUT_ROTATE_180;
     } else if (m == HTTTP_METHOD_DROP){
         if (blen == 4 && strncmp(body, "SOFT", 4) == 0) return TB_INPUT_SOFT_DROP;
         if (blen == 4 && strncmp(body, "HARD", 4) == 0) return TB_INPUT_HARD_DROP;
@@ -944,7 +955,8 @@ static void dispatch_request(client_t *c, const htttp_msg_t *msg){
 
     case HTTTP_METHOD_MOVE:
     case HTTTP_METHOD_ROTATE:
-    case HTTTP_METHOD_DROP: {
+    case HTTTP_METHOD_DROP:
+    case HTTTP_METHOD_HOLD: {
         int auth = check_player_id(c, msg);
         if (auth != 0){
             status = send_response(c, (htttp_status_t)auth, "{\"error\": \"auth\"}", NULL);
@@ -1174,17 +1186,46 @@ static void disconnect_client(int fd, const char *reason){
 
 // --- the room ticker: where the server runs the authoritative game --------------
 
+// Which visible cells the active piece would occupy if hard-dropped now.
+//
+// This is the server's copy of the projection tetrisu draws offline, and it
+// lives here because the client cannot reproduce it: tb_render MERGES the
+// active piece into the grid, so by the time a board reaches the wire there
+// is nothing marking which cells are falling and which are locked. Sending
+// the landing position as part of the board is what lets a client that owns
+// no game state still draw a ghost.
+static void mark_ghost(const tb_game *g, bool ghost[TB_ROWS][TB_COLS]){
+    memset(ghost, 0, TB_ROWS * TB_COLS * sizeof(bool));
+    if (g->game_over) return;
+    int gy = tb_ghost_y(g);
+    const tb_position *p = &tb_positions[g->active.type][g->active.orientation];
+    for (int i = 0; i < TB_CELLS_PER_PIECE; i++){
+        int x = g->active.origin.x + p->pos[i].x;
+        int y = gy + p->pos[i].y;
+        if (x >= 0 && x < TB_COLS && y >= 0 && y < TB_ROWS)
+            ghost[y][x] = true;
+    }
+}
+
 // Draw one player's board into dst, in the text format we send as the STATE
-// body. The first line has the player id and their score, level, lines and a
-// game-over flag. After that come 20 rows of 10 columns each, where a '.' is an
-// empty cell and a digit marks a filled cell.
+// body. The first line has the player id, their score, level, lines and a
+// game-over flag, then the NEXT and HOLD piece types (-1 for none) and
+// whether hold is spent this turn. After that come 20 rows of 10 columns
+// each, where a '.' is an empty cell, a digit marks a filled cell, and 'g'
+// marks an empty cell the active piece would land on.
 static size_t render_board(char *dst, size_t cap, const char *pid, const tb_game *g){
     int8_t cells[TB_ROWS][TB_COLS];
     tb_render(g, cells);
+    bool ghost[TB_ROWS][TB_COLS];
+    mark_ghost(g, ghost);
     size_t off = 0;
     off += (size_t)snprintf(dst + off, cap - off,
-                            "player %s score %u level %u lines %u over %d\n",
-                            pid, g->score, g->level, g->lines_total, g->game_over ? 1 : 0);
+                            "player %s score %u level %u lines %u over %d "
+                            "next %d hold %d held %d\n",
+                            pid, g->score, g->level, g->lines_total,
+                            g->game_over ? 1 : 0,
+                            tb_next_piece(g), (int)g->hold,
+                            g->held_this_turn ? 1 : 0);
     for (int y = 0; y < TB_ROWS && off + TB_COLS + 2 < cap; y++){
         for (int x = 0; x < TB_COLS; x++){
             int8_t c = cells[y][x];
@@ -1196,9 +1237,12 @@ static size_t render_board(char *dst, size_t cap, const char *pid, const tb_game
             // ever LOOKED at a drawn frame, which is how it survived until
             // the first visual pass. '1'..'7' matches the client renderer's
             // colour pairs; '8' is its garbage/fallback pair.
-            dst[off++] = (c < 0)  ? '.'
-                       : (c <= 6) ? (char)('1' + c)
-                                  : '8';
+            // Ghost only ever replaces an EMPTY cell, so a real block is
+            // never hidden by the projection of the piece that will land on
+            // it -- the same precedence the offline renderer uses.
+            dst[off++] = (c >= 0)   ? ((c <= 6) ? (char)('1' + c) : '8')
+                       : ghost[y][x] ? 'g'
+                                     : '.';
         }
         dst[off++] = '\n';
     }

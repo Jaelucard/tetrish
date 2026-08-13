@@ -131,6 +131,7 @@ static const struct {htttp_method_t m; const char *s;} _method_table[] = {
     {HTTTP_METHOD_DROP, "DROP"},
     {HTTTP_METHOD_STATE, "STATE"},
     {HTTTP_METHOD_GET, "GET"},
+    {HTTTP_METHOD_HOLD, "HOLD"},
     {HTTTP_METHOD_UNKNOWN, NULL}
 };
 
