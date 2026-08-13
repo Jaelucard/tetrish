@@ -89,7 +89,7 @@ TETRISD_OBJ := $(BUILDDIR)/tetrisd/main.o $(RING_OBJ) \
 # editing a header it includes would NOT rebuild it -- an incremental make
 # would silently link stale code.
 TETRISU_OBJ := $(BUILDDIR)/tetrisu/main.o $(BUILDDIR)/tetrisu/net.o \
-               $(BUILDDIR)/tetrisu/tetrisu.o
+               $(BUILDDIR)/tetrisu/tetrisu.o $(BUILDDIR)/tetrisu/music.o
 VIEW_OBJ    := $(BUILDDIR)/tetrish-view/main.o $(BUILDDIR)/tetrish-view/control.o \
                $(BUILDDIR)/tetrish-view/repl.o $(BUILDDIR)/tetrish-view/dispatch.o \
                $(BUILDDIR)/tetrish-view/jsonish.o $(BUILDDIR)/tetrish-view/edit.o \
@@ -123,7 +123,8 @@ TEST_OBJ  := $(BUILDDIR)/tests/test_ring.o $(BUILDDIR)/tests/stress_ring.o \
 # stem, and an undefined one (the common case for a pure, self-contained
 # test) is simply empty.
 SANFLAGS      := -fsanitize=address,undefined -fno-omit-frame-pointer
-SAN_TEST_SRCS := $(wildcard tests/test_brain*.c) $(wildcard tests/test_view*.c)
+SAN_TEST_SRCS := $(wildcard tests/test_brain*.c) $(wildcard tests/test_view*.c) \
+                 $(wildcard tests/test_music*.c)
 SAN_TEST_BINS := $(patsubst tests/%.c,$(BUILDDIR)/tests-san/%,$(SAN_TEST_SRCS))
 
 SAN_EXTRA_SRC_test_brain := src/libtetrisbrain/tetrisbrain.c
@@ -136,6 +137,9 @@ SAN_EXTRA_SRC_test_view_repl := src/tetrish-view/dispatch.c
 # build in the sanitized tier the same way dispatch.c does.
 SAN_EXTRA_SRC_test_view_json := src/tetrish-view/jsonish.c
 SAN_EXTRA_SRC_test_view_edit := src/tetrish-view/edit.c
+# music.c is pure synthesis plus posix process calls, no curses and no
+# libhtttp/libtetrissh dependency, so it fits the sanitized tier too.
+SAN_EXTRA_SRC_test_music := src/tetrisu/music.c
 
 # Every object we compile, so we can pull in its generated .d dependency file.
 BIN_OBJ := $(foreach n,$(BIN_NAMES),$(BUILDDIR)/$(n)/main.o)
