@@ -6,6 +6,7 @@
 // was pressed), advances the game by one tick, and redraws. Gravity needs no
 // special handling. The ticks themselves drive it.
 
+#include <locale.h>
 #include <ncurses.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -196,7 +197,8 @@ int tetrisu_local_run(uint32_t seed, uint32_t start_level)
     signal(SIGINT, on_sigint);
 
     // standard ncurses game setup: raw-ish keys, no echo, non-blocking
-    // getch so a frame never waits for input, hidden cursor
+    // getch so a frame never waits for input, hidden cursor.
+    setlocale(LC_ALL, "");
     initscr();
     cbreak();
     noecho();

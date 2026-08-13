@@ -53,6 +53,7 @@
 // SO_RCVTIMEO and SO_SNDTIMEO bound that wait instead, which is the same
 // mechanism the server uses on its side of the same library.
 
+#include <locale.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -189,7 +190,7 @@ static void draw_all(const net_ctx *net, const char *room, int connected){
     int f = board_top + VIEW_ROWS + 3;
     if (f < LINES)
         mvprintw(f, BOARD_LEFT,
-                 "left/right move - down soft - space hard - up/x rot cw - z ccw - q quit");
+                 "arrows move - down soft - space hard - x/z rot - q quit");
 
     // One doupdate per frame rather than a refresh per element, so the screen
     // updates atomically and never tears between boards.
@@ -294,6 +295,7 @@ int main(int argc, char **argv){
     if (st != 200 && st != 409) die("START refused by the server", "");
 
     // Curses comes up only now, so every failure above prints normally.
+    setlocale(LC_ALL, "");
     atexit(restore_terminal);
     initscr();
     g_curses_up = 1;
@@ -339,9 +341,12 @@ int main(int argc, char **argv){
 
         // Independent ifs, never else-if. At 20 Hz the socket is ready on
         // almost every frame, and an else-if chain would starve the keyboard.
+        // Drained in a loop (the fd is non-blocking): anything on this
+        // descriptor is a request to quit.
         if (FD_ISSET(sigfd, &rfds)){
             struct signalfd_siginfo si;
-            if (read(sigfd, &si, sizeof si) == (ssize_t)sizeof si) running = 0;
+            while (read(sigfd, &si, sizeof si) == (ssize_t)sizeof si)
+                running = 0;
         }
 
         if (FD_ISSET(STDIN_FILENO, &rfds)){
