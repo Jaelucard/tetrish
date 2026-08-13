@@ -45,6 +45,10 @@ BRAIN_OBJ := $(BUILDDIR)/libtetrisbrain/tetrisbrain.o
 # clients.o/rooms.o : tetrisd's per-connection + room state (Week 6)
 COMMON_OBJ  := $(BUILDDIR)/common/rc.o
 DAEMON_OBJ  := $(BUILDDIR)/common/daemon.o
+# stateview.o : the STATE-stream client shared by tetrisu and tetrish-view
+# --live. Frame classification, STATE parsing and the board renderer. One
+# implementation so player and spectator can never drift apart.
+STATEVIEW_OBJ := $(BUILDDIR)/common/stateview.o
 RING_OBJ    := $(BUILDDIR)/tetrisd/ring.o
 TETRISD_OBJ := $(BUILDDIR)/tetrisd/main.o $(RING_OBJ) \
                $(BUILDDIR)/tetrisd/clients.o $(BUILDDIR)/tetrisd/rooms.o
@@ -65,7 +69,7 @@ TEST_OBJ  := $(BUILDDIR)/tests/test_ring.o $(BUILDDIR)/tests/stress_ring.o \
 
 # Every object we compile, so we can pull in its generated .d dependency file.
 BIN_OBJ := $(foreach n,$(BIN_NAMES),$(BUILDDIR)/$(n)/main.o)
-ALL_OBJ := $(SSH_OBJ) $(HTTTP_OBJ) $(BRAIN_OBJ) $(COMMON_OBJ) $(DAEMON_OBJ) $(TETRISD_OBJ) $(BIN_OBJ) $(TEST_OBJ)
+ALL_OBJ := $(SSH_OBJ) $(HTTTP_OBJ) $(BRAIN_OBJ) $(COMMON_OBJ) $(DAEMON_OBJ) $(STATEVIEW_OBJ) $(TETRISD_OBJ) $(BIN_OBJ) $(TEST_OBJ)
 
 .PHONY: all libs bins test clean
 
@@ -122,17 +126,17 @@ $(BINDIR)/tetrisctl: $(BUILDDIR)/tetrisctl/main.o $(COMMON_OBJ) $(LIB_HTTTP)
 # tetrisu links the session layer, the protocol and ncurses, but deliberately
 # NOT libtetrisbrain: the server is authoritative and sends the finished board,
 # so the client holds no game state and cannot disagree with it.
-$(BINDIR)/tetrisu: $(BUILDDIR)/tetrisu/main.o $(COMMON_OBJ) $(LIB_SSH) $(LIB_HTTTP)
+$(BINDIR)/tetrisu: $(BUILDDIR)/tetrisu/main.o $(STATEVIEW_OBJ) $(COMMON_OBJ) $(LIB_SSH) $(LIB_HTTTP)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -o $@ $^ $(SSLLIBS) -lncurses
 
-# tetrish-view replays a recorded session, so it links the game engine (it
-# reconstructs boards by calling tb_tick, the same entry point tetrisd uses)
-# and ncurses for rendering. It needs no sockets and no crypto: it reads a log
-# file, nothing more.
-$(BINDIR)/tetrish-view: $(BUILDDIR)/tetrish-view/main.o $(LIB_BRAIN)
+# tetrish-view is both halves of the 50.003 app. Replay mode links the game
+# engine (it reconstructs boards by calling tb_tick, the same entry point
+# tetrisd uses). Live spectator mode links the session layer, the protocol
+# and the shared STATE renderer, exactly like tetrisu.
+$(BINDIR)/tetrish-view: $(BUILDDIR)/tetrish-view/main.o $(STATEVIEW_OBJ) $(COMMON_OBJ) $(LIB_BRAIN) $(LIB_SSH) $(LIB_HTTTP)
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) -o $@ $^ -lncurses
+	$(CC) $(CFLAGS) -o $@ $^ $(SSLLIBS) -lncurses
 
 # --- Tests ---
 # Test sources live in tests/ (not src/), so they get their own compile rule.
