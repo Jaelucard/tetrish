@@ -31,6 +31,10 @@ typedef enum {
     HTTTP_METHOD_DROP,
     HTTTP_METHOD_STATE, /* Server-originated broadcast. */
     HTTTP_METHOD_GET,   /* For control-plane polls.     */
+    HTTTP_METHOD_HOLD,  /* Appended: swap the active piece with the held one.
+                           Last on purpose, so every value above keeps the
+                           number it already had and a stale peer that never
+                           sends HOLD is unaffected. */
 } htttp_method_t;
 
 typedef enum {

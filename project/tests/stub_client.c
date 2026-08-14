@@ -163,9 +163,16 @@ int main(int argc, char **argv){
     long before = state_frames;
     struct timespec ts0, ts1;
     clock_gettime(CLOCK_MONOTONIC, &ts0);
-    int move_status = 0;
     char ppath[96];
     snprintf(ppath, sizeof ppath, "/room/%s/player/%s", room, player_id);
+
+    // The three inputs are sent at different points in the stream and their
+    // acknowledgements come back in that same order, so recording responses
+    // positionally is enough to tell which status belongs to which request.
+    int  acks[3] = {0, 0, 0};      // MOVE, HOLD, ROTATE 180
+    int  nacks = 0;
+    int  saw_ghost = 0;            // any frame carrying a landing projection
+    char header[256] = {0};        // first STATE header line, for the field check
 
     for (;;){
         clock_gettime(CLOCK_MONOTONIC, &ts1);
@@ -180,8 +187,10 @@ int main(int argc, char **argv){
             char keep2[4096];
             size_t klen = plen < sizeof keep2 ? plen : sizeof keep2 - 1;
             memcpy(keep2, plain, klen);
-            if (htttp_parse_response(keep2, klen, &resp) == HTTTP_OK)
-                move_status = (int)resp.status;              // This is the server's acknowledgement of our MOVE request.
+            // The server's acknowledgement of one of our input requests.
+            if (htttp_parse_response(keep2, klen, &resp) == HTTTP_OK &&
+                nacks < 3)
+                acks[nacks++] = (int)resp.status;
         } else {
             htttp_msg_t streq;
             if (htttp_parse_request((const char *)plain, plen, &streq) == HTTTP_OK &&
@@ -189,6 +198,30 @@ int main(int argc, char **argv){
                 state_frames++;
                 if (state_frames == before + 5)              // We wait until we are partway through the stream before sending our input.
                     send_request(HTTTP_METHOD_MOVE, ppath, player_id, "LEFT");
+                // HOLD carries no body at all -- the method is the whole
+                // instruction -- which is exactly the case worth pinning down
+                // here, since every other input the server accepts has one.
+                if (state_frames == before + 10)
+                    send_request(HTTTP_METHOD_HOLD, ppath, player_id, NULL);
+                if (state_frames == before + 15)
+                    send_request(HTTTP_METHOD_ROTATE, ppath, player_id, "180");
+
+                if (streq.body != NULL && streq.body_len > 0){
+                    // Keep the first header line for the field check, and
+                    // watch every frame for a ghost: a piece resting on the
+                    // stack projects onto cells it already fills, so no single
+                    // frame is guaranteed to carry one.
+                    if (header[0] == '\0'){
+                        const char *nl = memchr(streq.body, '\n', streq.body_len);
+                        size_t hl = nl ? (size_t)((const char *)nl - streq.body)
+                                       : streq.body_len;
+                        if (hl >= sizeof header) hl = sizeof header - 1;
+                        memcpy(header, streq.body, hl);
+                        header[hl] = '\0';
+                    }
+                    if (memchr(streq.body, 'g', streq.body_len) != NULL)
+                        saw_ghost = 1;
+                }
             }
         }
         free(plain);
@@ -202,7 +235,20 @@ int main(int argc, char **argv){
     double hz = (double)got / elapsed;
     printf("ok  STATE stream: %ld frames in %.2fs (%.1f Hz, expected %d Hz)\n",
            got, elapsed, hz, cfg.tick_hz);
-    printf("%s MOVE ack -> %d\n", move_status == 200 ? "ok " : "FAIL", move_status);
+    printf("%s MOVE ack -> %d\n", acks[0] == 200 ? "ok " : "FAIL", acks[0]);
+    printf("%s HOLD ack -> %d\n", acks[1] == 200 ? "ok " : "FAIL", acks[1]);
+    printf("%s ROTATE 180 ack -> %d\n", acks[2] == 200 ? "ok " : "FAIL", acks[2]);
+
+    // The preview fields and the ghost are what the offline-style client
+    // renders from; without them it falls back to an empty NEXT/HOLD box and
+    // no landing projection, which is the regression worth catching here.
+    int have_next  = strstr(header, " next ") != NULL;
+    int have_hold  = strstr(header, " hold ") != NULL;
+    int have_held  = strstr(header, " held ") != NULL;
+    int fields_ok  = have_next && have_hold && have_held;
+    printf("%s STATE header carries next/hold/held: \"%s\"\n",
+           fields_ok ? "ok " : "FAIL", header);
+    printf("%s STATE grid carries a ghost projection\n", saw_ghost ? "ok " : "FAIL");
 
     // We send LEAVE and expect a 200 status. This also exercises the server's room destruction logic.
     if (send_request(HTTTP_METHOD_LEAVE, path, player_id, NULL) != 0) return 1;
@@ -215,7 +261,8 @@ int main(int argc, char **argv){
 
     // Here we check the frame rate: we allow it to be within 25% of tick_hz, to leave some room for scheduling jitter.
     int pass = got > expected * 3 / 4 && got < expected * 5 / 4 &&
-               move_status == 200 && st == 200;
+               acks[0] == 200 && acks[1] == 200 && acks[2] == 200 &&
+               fields_ok && saw_ghost && st == 200;
     printf("%s\n", pass ? "STUB CLIENT: ALL PASS" : "STUB CLIENT: FAIL");
     return pass ? 0 : 1;
 }

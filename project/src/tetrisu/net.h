@@ -12,6 +12,10 @@
 #include "rc.h"
 #include "tetrissh.h"
 #include "htttp.h"
+// board_t's next/hold carry tb_piece_type indices, and both the parser (to
+// range check them) and the renderer (to look them up in tb_positions) need
+// the brain's piece vocabulary to make sense of them.
+#include "tetrisbrain.h"
 
 #define NET_VIEW_ROWS  20     // must match the server's board, checked on arrival
 #define NET_VIEW_COLS  10
@@ -24,6 +28,11 @@ typedef struct {
     char     id[32];
     unsigned score, level, lines;
     int      over;
+    // The piece previews, straight off the wire as tb_piece_type indices.
+    // -1 means "none": an empty hold slot, or a next piece the server is not
+    // disclosing at a bag boundary. held is 1 once hold is spent for this
+    // turn, which is what dims the box the way the offline client does.
+    int      next, hold, held;
     char     cells[NET_VIEW_ROWS][NET_VIEW_COLS];
     int      rows_filled;        // how many rows this block actually supplied
 } board_t;

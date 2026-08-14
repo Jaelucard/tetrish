@@ -4,32 +4,55 @@
 #include <errno.h>
 #include "rc.h"
 
-// --- helpers -------------------------------------------------------------
 
-// Parse `s` as an integer in the given base (10 for normal ints, 8 for the
-// octal ctl_perm). Returns 0 on success and writes the value to *out.
-// Returns -1 if the text is not a clean number (strtol's classic checks:
-// nothing consumed -> end==s, trailing junk -> *end != '\0', or overflow).
-static int parse_int(const char *s, int base, int *out) {
-    char *end;
-    errno = 0;
-    long v = strtol(s, &end, base);
-    if (end == s || *end != '\0' || errno == ERANGE)
-        return -1;
-    *out = (int)v;
+// ====== Helper functions for rc_load() ======
+
+// Is this word a configuration directive rather than a command?
+//
+// .tetrishrc has two readers. The daemons read it as configuration; tetrish
+// also executes it at startup, the way a shell runs its rc file. A line
+// rc_load already ate as a directive is not a command, so the shell skips it
+// instead of trying to exec "listen_port" and printing a not-found error for
+// every directive in the file. Anything NOT in this list goes to the normal
+// command dispatch, so real shell lines (dspawn ...) can live in the same file
+// and still run.
+//
+// This list mirrors the dispatch chain in rc_load below. New directive there,
+// new entry here.
+int rc_is_directive(const char *word){
+    static const char *keys[] = {
+        "cert_path", "key_path", "ca_path", "log_path", "log_ipc", "ctl_path",
+        "pid_path", "bind", "log_level", "garbage_mq", "listen_port",
+        "tcp_backlog", "tcp_keepalive", "client_timeout", "max_clients",
+        "max_conns_per_ip", "handshake_budget", "tick_hz", "snapshot_interval",
+        "max_rooms", "max_players_per_room", "ctl_perm", "daemonize",
+    };
+    for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++)
+        if (strcmp(word, keys[i]) == 0) return 1;
     return 0;
 }
 
-// Copy `src` into the fixed buffer `dst` of size `dstsz`, always
-// null-terminating (strncpy does NOT terminate if the source fills the
-// buffer, so we set the last byte by hand).
+// String to int with error checking. 0 on success, -1 on failure.
+static int parse_int(const char *s, int base, int *out){
+    char *end;
+    errno = 0; // strtol sets errno to ERANGE on overflow, so we clear it first.
+    long v = strtol(s, &end, base); // end gets set to the first character strtol couldnt consume and that is the whole error detection mechanism
+    if (end == s || *end != '\0' || errno == ERANGE) 
+        return -1; // Three different ways to fail: no digits, leftover junk, or overflow/underflow
+    *out = (int)v; // Only write through the out-pointer if we succeed, so a failed parse leaves the caller's field at its default
+    return 0;
+}
+
+// strncpy doesnt terminate when the source fills the buffer.
+// If src is shorter than dstsz, strncpy will fill the rest of dst with null bytes.
+// If src is longer than dstsz, strncpy will not null-terminate dst.
+// So terminate it here by hand, every time.
 static void copy_str(char *dst, const char *src, size_t dstsz) {
     strncpy(dst, src, dstsz - 1);
     dst[dstsz - 1] = '\0';
 }
 
-// Interpret a yes/no value. Returns 0 and writes *out on success, -1 if the
-// word is neither truthy nor falsy.
+// yes/no value. 0 and writes *out on success, -1 if the word is neither.
 static int parse_bool(const char *s, bool *out) {
     if (strcmp(s, "yes") == 0 || strcmp(s, "true") == 0 || strcmp(s, "1") == 0)
         { *out = true;  return 0; }
@@ -65,8 +88,8 @@ int rc_load(const char *path, Config *out){
     out->max_rooms = 16;
     out->max_players_per_room = 6;
     strcpy(out->garbage_mq, "/tetrish-garbage"); // POSIX mq names must start with '/'
-    // Phase 2: open the file (fail loudly if missing, since a daemon with no
-    // config must refuse to start, not run on guesses).
+    // Phase 2: open the file. Fail loudly if it is missing: a daemon with no
+    // config must refuse to start, not run on guesses.
     FILE *fp = fopen(path, "r");
     if (fp == NULL) {
         fprintf(stderr, "rc_load: cannot open '%s': %s\n", path, strerror(errno));
@@ -81,10 +104,10 @@ int rc_load(const char *path, Config *out){
         // and writing '\0' there truncates the line at that point.
         line[strcspn(line, "#\n")] = '\0';
 
-        // (b) Split into "key value". sscanf's width limits (%63s/%255s) are
-        // mandatory: they stop a long token from overflowing these buffers.
-        // n < 2 means the line had no value -> blank/comment-only (skip) or a
-        // lone key (malformed -> warn).
+        // (b) Split into "key value". The sscanf widths (%63s/%255s) are not
+        // optional; they are what stops a long token overflowing these
+        // buffers. n < 2 means no value: blank or comment-only (skip), or a
+        // lone key (malformed, warn).
         char key[64], value[RC_PATHLEN];
         int n = sscanf(line, "%63s %255s", key, value);
         if (n <= 0)
@@ -95,7 +118,7 @@ int rc_load(const char *path, Config *out){
         }
 
         // (c) Dispatch: match the key, convert the value, store it. strcmp
-        // returns 0 on a match. A second line with the same key simply
+        // returns 0 on a match. A second line with the same key just
         // overwrites the first, so "last duplicate wins" comes for free.
         // Required string fields:
         if      (strcmp(key, "cert_path") == 0) copy_str(out->cert_path, value, RC_PATHLEN);
@@ -104,7 +127,7 @@ int rc_load(const char *path, Config *out){
         else if (strcmp(key, "log_path")  == 0) copy_str(out->log_path,  value, RC_PATHLEN);
         else if (strcmp(key, "log_ipc")   == 0) copy_str(out->log_ipc,   value, RC_PATHLEN);
         else if (strcmp(key, "ctl_path")  == 0) copy_str(out->ctl_path,  value, RC_PATHLEN);
-        // Optional string fields (note: directive "bind" maps to field bind_addr):
+        // Optional string fields (the directive "bind" maps to field bind_addr):
         else if (strcmp(key, "pid_path")  == 0) copy_str(out->pid_path,  value, RC_PATHLEN);
         else if (strcmp(key, "bind")      == 0) copy_str(out->bind_addr, value, RC_PATHLEN);
         else if (strcmp(key, "log_level") == 0) copy_str(out->log_level, value, RC_PATHLEN);
@@ -131,7 +154,8 @@ int rc_load(const char *path, Config *out){
                 return -1;
             }
         }
-        // Unknown directive: warn and ignore (forward-compatible).
+        // Unknown directive: warn, carry on. An older binary still starts on a
+        // newer config file that way.
         else
             fprintf(stderr, "rc_load: unknown directive '%s' (ignored)\n", key);
 
@@ -144,14 +168,13 @@ int rc_load(const char *path, Config *out){
 
     fclose(fp);
 
-    // Phase 4: verify every REQUIRED key was actually set (its sentinel was
-    // overwritten). A missing required key is a hard failure.
+    // Phase 4: check every REQUIRED key actually got set, i.e. its sentinel
+    // was overwritten. A missing one is a hard failure.
     int ok = 0;
     if (out->listen_port < 0)      { fprintf(stderr, "rc_load: missing required 'listen_port'\n"); ok = -1; }
-    // A TCP port number only goes up to 65535, because it is stored in 16 bits.
-    // If we let a bigger number through, the (uint16_t) cast that tetrisd uses
-    // later would quietly wrap it around to the wrong port (for example 70000
-    // would become 4464), so we reject it here instead.
+    // A TCP port is 16 bits, so it stops at 65535. Let anything bigger through
+    // and the (uint16_t) cast tetrisd does later wraps it to the wrong port
+    // without saying a word (70000 becomes 4464). Reject it here instead.
     else if (out->listen_port < 1 || out->listen_port > 65535){
         fprintf(stderr, "rc_load: listen_port %d out of range 1-65535\n", out->listen_port);
         ok = -1;

@@ -23,14 +23,12 @@ void handle_signal(int sig){
 }
 
 // --- BACKGROUND JOBS (dspawn / sys / dcheck) ---
-// We keep track of every background program that we start with dspawn.
-// To do that, we store them in a linked list, where each item in the
-// list is one background job.
-// Only the main loop is allowed to read or change this list. The signal
-// handler that runs when a background child finishes does not touch the
-// list at all. It only sets a flag. We keep the handler this small on
-// purpose, because a signal handler is not allowed to safely call things
-// like malloc or printf.
+// Every background program started with dspawn goes in a linked list, one
+// item per job.
+// Only the main loop reads or changes this list. The handler that runs when a
+// background child finishes never touches it, it just sets a flag. The handler
+// stays that small on purpose: a signal handler cannot safely call malloc or
+// printf.
 typedef enum { JOB_RUNNING, JOB_DONE } JobStatus;
 typedef struct Job {
   pid_t pid;
@@ -62,14 +60,13 @@ static void job_add(pid_t pid, const char *cmd){
   jobs = j;
 }
 
-// Clean up after every background child that has finished. This is the step
-// that stops finished children from staying around as zombie processes.
-// We pass WNOHANG to waitpid, which means "return straight away instead of
-// waiting", so this never holds up the prompt. A return value of 0 means that
-// child is still running.
-// We call waitpid once for each specific pid, and never with -1. If we used
-// -1 here, waitpid could accidentally collect a foreground child that launch()
-// is currently waiting for, and then launch() would lose track of it.
+// Clean up after every background child that has finished, so none of them
+// hang around as zombies.
+// WNOHANG means "return straight away instead of waiting", so this never holds
+// up the prompt. A return of 0 means that child is still running.
+// waitpid is called once per specific pid, never with -1. With -1 it could
+// collect a foreground child that launch() is still waiting for, and launch()
+// would lose track of it.
 static void reap_jobs(void){
   child_exited = 0;
   for (Job *j = jobs; j != NULL; j = j->next){
@@ -168,11 +165,10 @@ static int cmd_sys(char **argv){
   return 0;
 }
 
-// dspawn CMD [ARGS...]: start CMD as a background job. This uses the same fork
-// and execvp steps as launch(), but with two differences. First, the parent
-// does not wait for the child. It just records the child's pid and goes back to
-// the prompt. Second, the child is moved into its own process group, so that a
-// Ctrl+C meant for the shell's foreground work cannot reach and kill the
+// dspawn CMD [ARGS...]: start CMD as a background job. Same fork and execvp as
+// launch(), with two differences. The parent does not wait; it records the pid
+// and goes back to the prompt. And the child is moved into its own process
+// group, so a Ctrl+C aimed at the shell's foreground work cannot reach the
 // background jobs.
 static int cmd_dspawn(char **argv){
   if (argv[1] == NULL){
@@ -195,9 +191,9 @@ static int cmd_dspawn(char **argv){
   return 0;
 }
 
-// dcheck PID: check on one job without waiting. If it is still running we say
-// so. If it has finished we report its exit code, and then we remove the job
-// from the list, because we only report a finished job once.
+// dcheck PID: check one job without waiting. Still running, we say so.
+// Finished, we print its exit code and drop it from the list, because a
+// finished job is only reported once.
 static int cmd_dcheck(char **argv){
   if (argv[1] == NULL){
     fprintf(stderr, "usage: dcheck PID\n");
@@ -218,8 +214,8 @@ static int cmd_dcheck(char **argv){
       printf("dcheck: pid %ld (%s) still running\n", v, j->cmd);
     } else {
       printf("dcheck: pid %ld (%s) exited with status %d\n", v, j->cmd, j->exit_code);
-      // Take this job out of the list. If it had a job before it, point that
-      // one past it. Otherwise it was the first job, so move the head forward.
+      // Unlink it. If something came before it, point that past it, otherwise
+      // it was the head, so move the head forward.
       if (prev) prev->next = j->next;
       else      jobs = j->next;
       free(j);                         // free the memory now that we have reported this job
@@ -273,14 +269,81 @@ static int launch(char **argv){
     _exit(127);                     // _exit (not exit) in a child: no stdio double-flush
   }
   // PARENT: reap the child so it does not linger as a zombie.
-  // The EINTR loop matters now that SIGINT has NO SA_RESTART: Ctrl+C aimed
-  // at the foreground child interrupts OUR waitpid too. Without the retry
-  // we would abandon the child (zombie + shell prompt fighting the child
-  // for the terminal).
+  // The EINTR retry matters now that SIGINT has no SA_RESTART: a Ctrl+C aimed
+  // at the foreground child interrupts OUR waitpid too. Drop the retry and we
+  // abandon the child, leaving a zombie and a shell prompt fighting it for the
+  // terminal.
   int status;
   while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
     ;                               // interrupted, child still ours: keep waiting
   return 0;
+}
+
+static int split_line(char *line, char **out, int max);   // defined below
+
+// --- ONE LINE OF SHELL ---
+// Tokenise `line` and run it: a builtin if the first word names one, otherwise
+// an external program. Returns 1 if the line asked the shell to exit.
+//
+// Exists so the REPL and the .tetrishrc reader below share one dispatch path.
+// Two copies of "builtin, else exec it" is two things to keep in step, and a
+// startup file that behaves differently from the prompt is a surprise, not a
+// feature.
+//
+// `line` is modified in place by the tokenizer, so callers must pass a
+// writable buffer, not a string literal.
+static int run_line(char *line){
+  char *cmdv[MAX_ARGS];
+  int n = split_line(line, cmdv, MAX_ARGS);
+  if (n == 0)                       // blank or whitespace-only
+    return 0;
+
+  for (int i = 0; i < N_BUILTINS; i++){
+    if (strcmp(cmdv[0], names[i]) == 0)
+      return funcs[i](cmdv);        // cmd_exit returns 1; the rest return 0
+  }
+  launch(cmdv);                     // not a builtin: run it as a program
+  return 0;
+}
+
+// --- .tetrishrc EXECUTION ---
+// Run the rc file the way a shell runs its startup file: every line, in order,
+// through the same dispatch the prompt uses.
+//
+// The file is shared with the daemons, which read the same lines as
+// configuration. Lines rc_load already consumed as directives are skipped
+// (rc_is_directive); everything else is executed. That is what lets a user put
+//
+//     dspawn bin/tetrislogd .tetrishrc
+//     dspawn bin/tetrisd .tetrishrc
+//
+// in the rc file next to listen_port and have the whole system come up on
+// `tetrish` alone, without the shell trying to exec "listen_port" and printing
+// a not-found error for every directive in the file.
+//
+// A missing rc file is not an error here. rc_load has already run and would
+// have refused to start if the file were unreadable.
+static void run_rc_file(const char *path){
+  FILE *fp = fopen(path, "r");
+  if (fp == NULL) return;
+
+  char line[512];
+  while (fgets(line, sizeof line, fp) != NULL){
+    line[strcspn(line, "#\n")] = '\0';    // strip a trailing comment and the newline
+
+    // Peek at the first word without touching the line: split_line writes NULs
+    // into it, and we may still want to hand the whole line over.
+    char peek[512];
+    snprintf(peek, sizeof peek, "%s", line);
+    char *first = strtok(peek, " \t");
+    if (first == NULL) continue;          // blank line
+    if (rc_is_directive(first)) continue; // configuration, not a command
+
+    run_line(line);                       // exit from the rc file is ignored on purpose:
+                                          // an `exit` there would close the shell before
+                                          // the user ever saw a prompt.
+  }
+  fclose(fp);
 }
 
 // --- TOKENIZER ---
@@ -299,16 +362,14 @@ static int split_line(char *line, char **out, int max){
 }
 
 int main(int argc, char **argv){
-  // Set up the handler for SIGINT, which is the signal that Ctrl+C sends. We
-  // use sigaction with sa_flags set to 0, which means we deliberately do not
-  // ask for SA_RESTART.
-  // Here is why that matters. The older signal() function turns SA_RESTART on
-  // for you behind the scenes. With SA_RESTART on, a blocked fgets is quietly
-  // restarted after the handler runs, so pressing Ctrl+C looked like it did
-  // nothing, and the "Interrupted by user" branch further down could never
-  // run. With sa_flags set to 0, fgets instead returns NULL and sets errno to
-  // EINTR, so the loop notices the interrupt and can print a fresh prompt.
-  // (This is the same reason tetrislogd sets up its recvfrom the same way.)
+  // Handler for SIGINT, the signal Ctrl+C sends. sigaction with sa_flags 0, so
+  // no SA_RESTART, and that is the whole point.
+  // The older signal() turns SA_RESTART on behind your back. With it on, a
+  // blocked fgets gets quietly restarted after the handler runs, so Ctrl+C
+  // looked like it did nothing and the "Interrupted by user" branch below could
+  // never fire. With sa_flags 0, fgets returns NULL with errno EINTR instead,
+  // the loop sees the interrupt and prints a fresh prompt.
+  // (Same reason tetrislogd sets its recvfrom up this way.)
   struct sigaction sa_int;
   memset(&sa_int, 0, sizeof sa_int);
   sa_int.sa_handler = handle_signal;
@@ -316,13 +377,13 @@ int main(int argc, char **argv){
   sa_int.sa_flags = 0;
   sigaction(SIGINT, &sa_int, NULL);
 
-  // The system sends SIGCHLD whenever any of our children changes state, and
-  // that is how we find out that a background job has finished. We use
-  // sigaction instead of signal() so that the flags are written out clearly.
-  // This time we do want SA_RESTART, because if a SIGCHLD arrives while the
-  // user is in the middle of typing, we do not want it to cut off the fgets
-  // they are using. The trade-off is that we clean the finished job up a little
-  // later, right before the next prompt, instead of instantly.
+  // SIGCHLD arrives whenever one of our children changes state, which is how we
+  // find out a background job finished. sigaction again, so the flags are
+  // written out where you can see them.
+  // This one DOES want SA_RESTART: a SIGCHLD landing while the user is midway
+  // through typing must not cut off their fgets. The cost is that the finished
+  // job gets cleaned up a little later, just before the next prompt, instead of
+  // instantly.
   struct sigaction sa;
   memset(&sa, 0, sizeof sa);
   sa.sa_handler = handle_sigchld;
@@ -330,78 +391,59 @@ int main(int argc, char **argv){
   sa.sa_flags = SA_RESTART;
   sigaction(SIGCHLD, &sa, NULL);
 
-  // Creating a config file parser
-  // Provides functionality to read, write and modify config files
-  // Check if there are more than one command line arguments
-  // (load config BEFORE the banner: refuse to start silently on bad config)
+  // Config file, named on the command line or .tetrishrc by default.
+  // Loaded BEFORE the banner, so bad config refuses to start instead of
+  // printing a prompt and pretending everything is fine.
   const char *rc_path = (argc > 1) ? argv[1] : ".tetrishrc";
   Config config;
-  // Error case, if configuration loading fails
   if (rc_load(rc_path, &config) != 0){
-    // print error and exit
     fprintf(stderr, "Failed to load configuration from %s\n", rc_path);
-    return 1; // Exit with error code
+    return 1;
   }
 
   printf("Tetrish REPL - Type 'exit' or Ctrl + C to exit\n");
 
-  // Now the REPL shell needs to loop forever
+  // Run the rc file before the first prompt, the way a shell sources its
+  // startup file. rc_load above already read this same file for its config
+  // directives; this pass runs the lines that are commands.
+  run_rc_file(rc_path);
+
+  // The REPL itself
   while (1){
-    // If a background child finished while we were busy, clean it up now,
-    // before we print the prompt, so that no zombie process is left waiting
-    // past the next prompt.
+    // A background child that finished while we were busy gets cleaned up
+    // here, before the prompt, so no zombie survives past it.
     if (child_exited)
       reap_jobs();
 
-    // Need the prompt to appear immediately without any delays
+    // fflush or the prompt sits in the buffer until after the user types
     printf("tetrish> ");
     fflush(stdout);
 
-    // Clear the interrupted flag before reading
     interrupted = 0;
 
-    // Read the input from user via stdin
-    // Main idea: Ctrl + D to exit the program and Ctrl + C to return to prompt
-    // Check if fgets fails to read from stdin
+    // Ctrl+D exits the program, Ctrl+C goes back to the prompt.
+    // fgets returning NULL is either of those, or a real error.
     if (fgets(input, sizeof(input), stdin) == NULL){
       if (feof(stdin)) {
         printf("\nEOF received, exiting....\n");
         break;
       } else if (interrupted){
-        // User pressed Ctrl+C during input
         printf("\nInterrupted by user\n");
         continue;
       } else {
-      // Some other error occured
+      // something else went wrong
       printf("\nError reading input\n");
       continue;
     }
     }
-    // Remove the trailing newline character added by fgets
+    // fgets keeps the newline; cut it off
     input[strcspn(input, "\n")] = '\0';
 
-    // Split the line into a command word + its arguments.
-    char *cmdv[MAX_ARGS];
-    int n = split_line(input, cmdv, MAX_ARGS);
-    if (n == 0)                 // blank / whitespace-only line -> reprompt
-      continue;
-
-    // Is the command word one of our builtins? Walk the dispatch table.
-    int handled = 0, want_exit = 0;
-    for (int i = 0; i < N_BUILTINS; i++){
-      if (strcmp(cmdv[0], names[i]) == 0){
-        want_exit = funcs[i](cmdv);   // call the matching handler through its pointer
-        handled = 1;
-        break;
-      }
-    }
-    if (want_exit)              // cmd_exit asked us to quit
+    // Builtin if the first word names one, otherwise an external program. Same
+    // function the rc file goes through, so prompt and startup file cannot
+    // drift apart.
+    if (run_line(input))        // cmd_exit asked us to quit
       break;
-    if (handled)               // a builtin ran -> next prompt
-      continue;
-
-    // Not a builtin -> treat it as an external program.
-    launch(cmdv);
   }
   return 0;
 }

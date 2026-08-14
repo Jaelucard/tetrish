@@ -75,6 +75,15 @@
 #define BOARD_LEFT      2
 #define FRAME_US    16000        // ~60 Hz display against a 20 Hz server
 
+// Horizontal layout, deliberately identical to the offline client's so the
+// two modes look the same: your board on the left, the NEXT/HOLD boxes and
+// the control list beside it, and -- the one thing offline has no need for --
+// the other players' boards after that.
+#define BOARD_TOP       1
+#define SIDE_LEFT   (BOARD_LEFT + VIEW_COLS * CELL_W + 4)
+#define SIDE_W         22        // widest control line ("down     soft drop")
+#define OPP_LEFT    (SIDE_LEFT + SIDE_W)
+
 // Vertical budget. A classic terminal is 80x24 and the client must fit one,
 // so the mandatory part is: one title row, the top border, VIEW_ROWS of board,
 // and the bottom border. That is exactly 23 rows, leaving row 23 for a footer.
@@ -122,6 +131,42 @@ static void draw_frame_at(int top, int left){
     }
 }
 
+// A small 4x4 preview box for NEXT/HOLD. type < 0 (an empty hold slot, or a
+// next piece the server withheld at a bag boundary) draws the label only.
+//
+// The shape comes from tb_positions, the same table the engine and the
+// offline renderer use, so a preview here is drawn from the piece's real
+// orientation-0 geometry rather than a second hand-maintained copy of it.
+// Only the type index crosses the wire.
+static void draw_piece_box(int top, int left, const char *label, int type, int dim){
+    mvprintw(top, left, "%s", label);
+    if (type < 0 || type >= TB_NUM_PIECES) return;
+    const tb_position *p = &tb_positions[type][0];
+    if (dim) attron(A_DIM);
+    for (int i = 0; i < TB_CELLS_PER_PIECE; i++){
+        int x = p->pos[i].x, y = p->pos[i].y;
+        if (x >= 0 && x < 4 && y >= 0 && y < 4)
+            mvprintw(top + 1 + y, left + x * CELL_W, "[]");
+    }
+    if (dim) attroff(A_DIM);
+}
+
+// The control list, kept as data so the drawing loop and any future width
+// check share one source of truth. This is the offline list minus retry and
+// pause: a room ticks for everyone at once, so neither has a meaning the
+// server could honour for a single player.
+static const char *g_controls[] = {
+    "CONTROLS",
+    "left/right move",
+    "down     soft drop",
+    "space    hard drop",
+    "up / x   rotate cw",
+    "z        rotate ccw",
+    "a        rotate 180",
+    "c        hold",
+    "q        quit",
+};
+
 // draws one player's board exactly as the server broadcast it: border,
 // cells (coloured by the digit the server sent), name row, score line, and
 // a GAME OVER banner when their flag is set. is_me marks our own board
@@ -134,6 +179,11 @@ static void draw_board(const board_t *b, int top, int left, int is_me){
             char c = (y < b->rows_filled) ? b->cells[y][x] : '.';
             if (c == '.' || c == '\0'){
                 attron(A_DIM); mvprintw(sy, sx, " ."); attroff(A_DIM);
+            } else if (c == 'g'){
+                // The landing projection the server computed for us. Drawn
+                // dim and uncoloured, exactly as the offline renderer draws
+                // its locally-computed ghost.
+                attron(A_DIM); mvprintw(sy, sx, "[]"); attroff(A_DIM);
             } else {
                 // Colour pair keyed on the cell digit, so the renderer needs no
                 // knowledge of piece types at all. Falls back to reverse video
@@ -150,47 +200,98 @@ static void draw_board(const board_t *b, int top, int left, int is_me){
     // %-*u pads over whatever was there before, so the numbers never leave a
     // stale trailing digit behind and no erase of the region is needed.
     // The name row sits above the board and only exists on a taller terminal.
+    // Our own board is drawn at top == 1 precisely so this is skipped: the
+    // title row already names us, and starting a row higher is what lines the
+    // board up with the offline layout.
     if (top >= 2)
         mvprintw(top - 1, left, "%s%-12s", is_me ? "> " : "  ", b->id);
+    // Opponents only. Our own score goes in the full-width footer draw_all
+    // writes, on this exact row -- drawing both would put two score lines on
+    // top of each other and leave whichever ran last showing.
     int scoreline = top + VIEW_ROWS + 2;
-    if (scoreline < LINES)
-        mvprintw(scoreline, left, "%c%-6u %-5u", is_me ? '>' : ' ',
-                 b->score, b->lines);
-    if (b->over){
+    if (!is_me && scoreline < LINES)
+        mvprintw(scoreline, left, " %-6u %-5u", b->score, b->lines);
+    // The banner over our own board is drawn by draw_all instead, in the
+    // offline client's two-line form. This is the compact one for opponents.
+    if (b->over && !is_me){
         attron(A_BOLD);
         mvprintw(top + VIEW_ROWS / 2, left + 3, " GAME OVER ");
         attroff(A_BOLD);
     }
 }
 
-// redraws the whole frame: title row, every board the last STATE frame
-// carried (side by side, as many as fit the terminal), and the key help
-// footer. everything drawn here comes from net_ctx -- this client holds no
-// game state of its own.
+// redraws the whole frame in the offline client's layout: title row, YOUR
+// board with its NEXT/HOLD previews and control list beside it, a score
+// footer, and then the other players' boards to the right of all that.
+// everything drawn here comes from net_ctx -- this client holds no game state
+// of its own, so the previews and the ghost are read off the wire rather than
+// computed.
 static void draw_all(const net_ctx *net, const char *room, int connected){
     erase();
-
-    // Lay out from the bottom of the mandatory block upwards, so the board
-    // always fits and the optional rows absorb whatever is left over.
-    int have_names = (LINES >= VIEW_ROWS + 6);
-    int board_top  = have_names ? 2 : 1;      // the top border row
 
     mvprintw(0, BOARD_LEFT, "tetriSH %s as %s  states %ld  acks %ld%s",
              room, net->player_id, net->states, net->acks,
              connected ? "" : "  [DISCONNECTED]");
 
-    int per = VIEW_COLS * CELL_W + 4;
-    for (int i = 0; i < net->nboards; i++){
-        int left = BOARD_LEFT + i * per;
-        if (left + per > COLS) break;         // never draw off the screen edge
-        draw_board(&net->boards[i], board_top, left,
-                   strcmp(net->boards[i].id, net->player_id) == 0);
+    // Which board is ours. -1 until the first STATE frame arrives (and, for a
+    // spectator, for the whole session), which is why every use of it below
+    // is guarded rather than assumed.
+    int me = -1;
+    for (int i = 0; i < net->nboards; i++)
+        if (strcmp(net->boards[i].id, net->player_id) == 0){ me = i; break; }
+
+    if (me >= 0){
+        const board_t *b = &net->boards[me];
+        // No name row above our own board: the title row already says who we
+        // are, and leaving it off puts the board at the same height offline
+        // draws it.
+        draw_board(b, BOARD_TOP, BOARD_LEFT, 1);
+
+        if (SIDE_LEFT + SIDE_W <= COLS){
+            draw_piece_box(BOARD_TOP,     SIDE_LEFT, "NEXT", b->next, 0);
+            // Dimmed once hold is spent, so the box shows both what is in
+            // there and that it cannot be swapped again until the next lock.
+            draw_piece_box(BOARD_TOP + 6, SIDE_LEFT, "HOLD", b->hold, b->held);
+
+            for (size_t i = 0; i < sizeof g_controls / sizeof g_controls[0]; i++){
+                int row = BOARD_TOP + 12 + (int)i;
+                if (row >= LINES) break;
+                if (i > 0) attron(A_DIM);
+                mvprintw(row, SIDE_LEFT, "%s", g_controls[i]);
+                if (i > 0) attroff(A_DIM);
+            }
+        }
+
+        // Unpadded, character for character the offline footer: draw_all
+        // erases the screen at the top of every frame, so there is no stale
+        // text underneath for a field width to have to cover.
+        int footer = BOARD_TOP + VIEW_ROWS + 2;
+        if (footer < LINES)
+            mvprintw(footer, BOARD_LEFT,
+                     "Score: %u  |  Lines: %u  |  Level: %u",
+                     b->score, b->lines, b->level);
+
+        if (b->over){
+            int my = BOARD_TOP + VIEW_ROWS / 2;
+            attron(A_BOLD);
+            mvprintw(my,     BOARD_LEFT + 2, "    GAME OVER     ");
+            mvprintw(my + 1, BOARD_LEFT + 2, "      q quit      ");
+            attroff(A_BOLD);
+        }
     }
 
-    int f = board_top + VIEW_ROWS + 3;
-    if (f < LINES)
-        mvprintw(f, BOARD_LEFT,
-                 "arrows move - down soft - space hard - x/z rot - q quit");
+    // The opponents, in wire order with our own board skipped, starting past
+    // the sidebar. Each gets a name row and a compact score line; the loop
+    // stops at the screen edge rather than drawing off it.
+    int per = VIEW_COLS * CELL_W + 4;
+    int col = 0;
+    for (int i = 0; i < net->nboards; i++){
+        if (i == me) continue;
+        int left = OPP_LEFT + col * per;
+        if (left + per > COLS) break;
+        draw_board(&net->boards[i], BOARD_TOP + 1, left, 0);
+        col++;
+    }
 
     // One doupdate per frame rather than a refresh per element, so the screen
     // updates atomically and never tears between boards.
@@ -368,9 +469,17 @@ int main(int argc, char **argv){
                                 m = HTTTP_METHOD_ROTATE; body = "CCW";   break;
                 case KEY_DOWN:  m = HTTTP_METHOD_DROP;   body = "SOFT";  break;
                 case ' ':       m = HTTTP_METHOD_DROP;   body = "HARD";  break;
-                // No 180/hold/pause here: the wire protocol carries only
-                // MOVE/ROTATE/DROP, and a server-authoritative multiplayer
-                // room cannot pause for one player. Local mode has them all.
+                case 'a': case 'A':
+                                m = HTTTP_METHOD_ROTATE; body = "180";   break;
+                // HOLD is the one action with no body: the method is the
+                // whole instruction. It still has to set `body`, because that
+                // is what the send below tests to decide a key produced an
+                // action at all -- so it sends an empty body rather than none.
+                case 'c': case 'C':
+                                m = HTTTP_METHOD_HOLD;   body = "";      break;
+                // Still no pause or retry: a room ticks for every player at
+                // once, so neither has a meaning the server could honour for
+                // one seat. Local mode has them.
                 case 'q': case 'Q': running = 0; break;
                 default: break;                       // ERR and unknown keys
                 }

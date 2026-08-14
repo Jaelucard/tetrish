@@ -1,55 +1,49 @@
-// This file is the logging service (daemon) that tetrisd sends its log
-// records to. It listens on an AF_UNIX SOCK_DGRAM socket, and for every log
-// record it receives, it adds a timestamp and appends it to the log file.
-// It runs as a detached daemon, which means it disconnects from the
-// terminal that started it and keeps running quietly in the background.
-#include <stdio.h>          // This gives us FILE, printf, and fprintf, for printing and for writing to files.
-#include <sys/socket.h>     // This gives us socket(), bind(), and recvfrom(). We do not need listen() or accept() because SOCK_DGRAM has no connections.
-#include <sys/un.h>         // This gives us the sockaddr_un structure, which we use to describe our Unix domain socket address.
-#include <sys/stat.h>       // This gives us umask(), which controls the default permissions on files we create.
-#include <unistd.h>         // This gives us fork(), setsid(), close(), dup2(), and unlink().
-#include <stdlib.h>         // This gives us exit().
-#include <string.h>         // This gives us memset, strncpy, strlen, and strerror.
-#include <errno.h>          // This gives us errno, which we check after a system call fails to see what went wrong.
-#include <signal.h>         // This gives us sigaction and sig_atomic_t, which we use to handle signals safely.
-#include <time.h>           // This gives us time, localtime_r, and strftime, which we use to build the timestamp we put on each log line.
+// The logging daemon tetrisd ships its records to. Listens on an AF_UNIX
+// SOCK_DGRAM socket, timestamps every record it receives, appends it to the log
+// file. Runs detached, so it lets go of the terminal that started it and stays
+// up in the background.
+#include <stdio.h>          // FILE, printf, fprintf
+#include <sys/socket.h>     // socket, bind, recvfrom. No listen or accept: SOCK_DGRAM has no connections
+#include <sys/time.h>       // struct timeval, for the receive timeout below
+#include <sys/un.h>         // sockaddr_un, the Unix domain socket address
+#include <sys/stat.h>       // umask
+#include <unistd.h>         // fork, setsid, close, dup2, unlink
+#include <stdlib.h>         // exit
+#include <string.h>         // memset, strncpy, strlen, strerror
+#include <errno.h>          // errno, checked after a failed syscall
+#include <signal.h>         // sigaction, sig_atomic_t
+#include <time.h>           // time, localtime_r, strftime, for the line timestamps
 #include "rc.h"
-#include "daemon.h"         // This gives us daemonize(), the shared double-fork helper that turns us into a background daemon.
+#include "daemon.h"         // daemonize(), the shared double-fork helper
 
-// These two flags are how our signal handlers talk to the rest of the
-// program. A signal handler has to be very small and can only safely call a
-// small set of functions, a property called being async-signal-safe. Things
-// like fopen() and fclose() are not safe to call from inside a handler. So
-// instead of doing real work in the handler, we just set a flag here, and
-// the main loop checks the flag and does the real work itself.
-static volatile sig_atomic_t running = 1;   // When SIGTERM arrives, the handler sets this to 0, and the main loop stops looping.
-static volatile sig_atomic_t reopen  = 0;   // When SIGHUP arrives, the handler sets this to 1, and the main loop reopens the log file.
+// How the signal handlers talk to the rest of the program. A handler may only
+// call async-signal-safe functions, and fopen/fclose are not on that list. So
+// the handler sets a flag and does nothing else; the main loop reads the flag
+// and does the actual work.
+static volatile sig_atomic_t running = 1;   // SIGTERM sets this to 0 and the main loop stops
+static volatile sig_atomic_t reopen  = 0;   // SIGHUP sets this to 1 and the main loop reopens the log
 
 static void on_signal(int sig){
-    if (sig == SIGTERM) running = 0;        // This starts a graceful shutdown.
-    else if (sig == SIGHUP) reopen = 1;     // This asks the main loop to rotate the log file.
+    if (sig == SIGTERM) running = 0;        // start shutting down
+    else if (sig == SIGHUP) reopen = 1;     // rotate the log file
 }
 
-// This function installs a signal handler using sigaction(), and it
-// deliberately leaves out the SA_RESTART flag. This makes the program more
-// robust than the older signal() function would. Without SA_RESTART, if a
-// signal arrives while recvfrom() is blocked waiting for data, recvfrom()
-// stops waiting and returns immediately with errno set to EINTR. That lets
-// our main loop notice that SIGTERM or SIGHUP has arrived right away,
-// instead of only finding out after the next datagram happens to arrive.
+// sigaction, deliberately without SA_RESTART (which is what the older signal()
+// would have given us). Without it, a signal arriving while recvfrom() is
+// blocked makes recvfrom() return straight away with errno EINTR, so the main
+// loop sees SIGTERM or SIGHUP now instead of whenever the next datagram
+// happens to turn up.
 static void install(int sig, void (*handler)(int)){
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = handler;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;                        // Setting this to 0 means SA_RESTART is turned off.
+    sa.sa_flags = 0;                        // 0 means no SA_RESTART
     sigaction(sig, &sa, NULL);
 }
 
-// This function opens the log file in append mode, so new log lines get
-// added to the end of the file instead of overwriting what is already
-// there. If opening the file fails, it prints an error message and returns
-// NULL.
+// Append mode, so new lines go on the end instead of over what is already
+// there. Prints why and returns NULL if the open fails.
 static FILE *open_log(const char *path){
     FILE *f = fopen(path, "a");
     if (f == NULL)
@@ -58,9 +52,8 @@ static FILE *open_log(const char *path){
 }
 
 int main(int argc, char **argv) {
-    // Step 1: load the configuration file. We need log_path, which tells us
-    // where to write the log file, and log_ipc, which tells us the path of
-    // the socket we will listen on.
+    // Step 1: config. We need log_path (where the log goes) and log_ipc (the
+    // socket path we listen on).
     const char *rc_path = (argc > 1) ? argv[1] : ".tetrishrc";
     Config config;
     if (rc_load(rc_path, &config) != 0){
@@ -68,98 +61,128 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // Step 2: install our signal handlers. SIGTERM tells us to stop, and
-    // SIGHUP tells us to reopen the log file.
+    // Step 2: handlers. SIGTERM stops us, SIGHUP reopens the log file.
     install(SIGTERM, on_signal);
     install(SIGHUP,  on_signal);
 
-    // Step 3: open the log file and the socket before we daemonize. We do
-    // this first so that if something goes wrong, we can still print an
-    // error message to the terminal where the user will see it. Both the
-    // file and the socket keep working after fork(), because a child
-    // process inherits its parent's open file descriptors.
+    // Step 3: open the log file and the socket BEFORE daemonizing, so that
+    // anything going wrong still prints to the terminal where somebody will
+    // see it. Both survive fork(); a child inherits its parent's open fds.
     FILE *log = open_log(config.log_path);
     if (log == NULL) return 1;
 
-    int sfd = socket(AF_UNIX, SOCK_DGRAM, 0);   // We use SOCK_DGRAM because this socket has no connections, unlike a stream socket.
+    int sfd = socket(AF_UNIX, SOCK_DGRAM, 0);   // datagram: no connections, unlike a stream socket
     if (sfd < 0){ perror("socket"); fclose(log); return 1; }
 
-    // A note on why this socket drops records under load, and why we do not
-    // try to stop it here.
+    // Why this socket drops records under load, and why nothing here tries to
+    // stop it.
     //
     // An AF_UNIX datagram socket's receive queue is bounded by the NUMBER OF
-    // MESSAGES it holds, not by their total size. The bound comes from
-    // net.unix.max_dgram_qlen, which is 10 on this system.
+    // MESSAGES it holds, not their total size. The bound is
+    // net.unix.max_dgram_qlen, 10 on this system.
     //
-    // Measured rather than assumed. Bind a socket, never read from it, and
-    // send until sendto() refuses:
+    // Measured, not assumed. Bind a socket, never read from it, send until
+    // sendto() refuses:
     //
     //     payload    1 B, SO_RCVBUF  229376 -> 11 datagrams, then EAGAIN
     //     payload 4096 B, SO_RCVBUF  229376 -> 11 datagrams, then EAGAIN
     //     payload    1 B, SO_RCVBUF 2097152 -> 11 datagrams, then EAGAIN
     //     payload 4096 B, SO_RCVBUF 2097152 -> 11 datagrams, then EAGAIN
     //
-    // A one-byte and a four-kilobyte payload stop at the same count, so the
-    // limit is messages. Eleven get through against a limit of ten, so the
-    // kernel's test is "queue length greater than the limit", not "greater or
-    // equal". And raising SO_RCVBUF nine-fold changes nothing, so SO_RCVBUF
-    // (which caps bytes) does not govern this at all. Raising it here was
-    // tried and reverted for exactly that reason.
+    // One byte and four kilobytes stop at the same count, so the limit counts
+    // messages. Eleven get through against a limit of ten, so the kernel's test
+    // is "queue length greater than the limit", not greater or equal. And a
+    // nine-fold SO_RCVBUF does nothing, so SO_RCVBUF (which caps bytes) is not
+    // what governs this. Raising it here was tried, then reverted.
     //
-    // We retire records with one fprintf plus one fflush each, which is a
-    // write() syscall per line. That is deliberate, so a crash cannot lose
-    // lines still sitting in a stdio buffer. It does mean that when tetrisd
-    // bursts more than ten records faster than we can write them, the eleventh
-    // is refused and tetrisd's non-blocking sendto fails.
+    // Records retire with one fprintf plus one fflush each, so a write()
+    // syscall per line. On purpose: a crash cannot then lose lines still
+    // sitting in a stdio buffer. The cost is that when tetrisd bursts more than
+    // ten records faster than we write them, the eleventh is refused and
+    // tetrisd's non-blocking sendto fails.
     //
-    // That is the designed behaviour, not a fault. tetrisd counts every such
-    // loss in its "send" drop counter, visible through `tetrisctl
-    // dropped-logs`, and gameplay never waits on logging. Measured: a single
-    // client produces zero drops; ten rooms all disconnecting at once produces
-    // a handful. The alternative, making the game block until the logger
-    // catches up, would trade a few lost log lines for a stalled tick.
+    // Which is the design, not a fault. tetrisd counts every such loss in its
+    // "send" drop counter, readable through `tetrisctl dropped-logs`, and the
+    // game never waits on logging. Measured: one client drops nothing, ten
+    // rooms disconnecting at once drops a handful. Making the game block until
+    // the logger caught up would trade a few log lines for a stalled tick.
 
-    // Here we build the socket address from the log_ipc path in the config.
+    // Socket address, built from log_ipc in the config.
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof addr);
     addr.sun_family = AF_UNIX;
-    if (strlen(config.log_ipc) >= sizeof addr.sun_path){   // sun_path is a small, fixed-size buffer, so we must check that the path actually fits before we copy it in.
+    if (strlen(config.log_ipc) >= sizeof addr.sun_path){   // sun_path is small and fixed, so check the path fits before copying
         fprintf(stderr, "tetrislogd: log_ipc path too long: %s\n", config.log_ipc);
         fclose(log); close(sfd); return 1;
     }
     strncpy(addr.sun_path, config.log_ipc, sizeof addr.sun_path - 1);
 
-    unlink(config.log_ipc);   // If a socket file from an earlier run is still sitting here, we remove it first.
-    if (bind(sfd, (struct sockaddr *)&addr, sizeof addr) < 0){   // We do not call listen() or accept() here, because a SOCK_DGRAM socket has no connections to accept.
+    // Before removing whatever is at that path, check it is not a socket
+    // another tetrislogd is still using.
+    //
+    // The unlink() below is what makes this necessary. Start this twice and the
+    // second instance deletes the first one's socket file and binds its own in
+    // place of it. The first daemon carries on quite happily on a socket that
+    // no longer has a name, so it never receives anything again, while
+    // tetrisd's records quietly start going to the second one. Then whichever
+    // exits first unlinks at the end of main and deletes the OTHER's socket
+    // node. Nothing in that whole sequence reports an error.
+    //
+    // The AF_UNIX way to ask "is anyone home?" is to try connecting: a live
+    // socket accepts, a file left behind by a crashed run refuses with
+    // ECONNREFUSED, an empty path gives ENOENT.
+    int probe = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (probe >= 0){
+        int live = (connect(probe, (struct sockaddr *)&addr, sizeof addr) == 0);
+        close(probe);
+        if (live){
+            fprintf(stderr, "tetrislogd: another tetrislogd is already bound to %s\n",
+                    config.log_ipc);
+            fclose(log); close(sfd); return 1;
+        }
+    }
+
+    unlink(config.log_ipc);   // only a stale node can be here now, so this is safe
+    if (bind(sfd, (struct sockaddr *)&addr, sizeof addr) < 0){   // no listen() or accept(): SOCK_DGRAM has no connections to accept
         perror("bind"); fclose(log); close(sfd); return 1;
     }
 
-    // Step 4: detach into the background and become a daemon, unless
-    // daemonize is set to no in the config file. Keeping it attached to the
-    // terminal like that is handy while we are debugging.
+    // Cap the wait in recvfrom so the loop keeps re-testing its two flags.
+    //
+    // Without it the loop is "test the flags, then block", and a signal landing
+    // in the gap between those two steps sets its flag and interrupts nothing:
+    // recvfrom parks anyway and only wakes on the next datagram. At shutdown
+    // there is no next datagram, since tetrisd is normally stopped first, so a
+    // SIGTERM lost that way leaves this daemon up with the log file open and
+    // nothing short of SIGKILL to end it. Same window quietly defers a SIGHUP
+    // rotation.
+    //
+    // The EINTR handling below does not cover this. It only helps when the
+    // signal arrives while recvfrom is ALREADY blocked. A timeout bounds the
+    // window instead. The proper fix is signalfd, which is what tetrisd uses
+    // and why tetrisd does not have this problem, but that means restructuring
+    // the loop; a receive timeout buys the same guarantee for one setsockopt.
+    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+    setsockopt(sfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+
+    // Step 4: detach into the background, unless daemonize is no in the config.
+    // Staying attached to the terminal is handy while debugging.
     if (config.daemonize){
         if (daemonize() < 0){ fclose(log); close(sfd); unlink(config.log_ipc); return 1; }
     }
 
-    // Step 5: this is the main loop. For every datagram we receive, we add
-    // a timestamp, append the record to the log file, and flush it right
-    // away.
+    // Step 5: the main loop. Every datagram gets a timestamp, gets appended to
+    // the log file, and gets flushed straight away.
     char buf[4096];
     while (running){
-        if (reopen){                        // SIGHUP has arrived, so it is time to rotate the log file.
+        if (reopen){                        // SIGHUP arrived: rotate the log
             reopen = 0;
-            // When SIGHUP asks us to rotate the log, we open the new file
-            // before we close the old one. That way, if opening the new
-            // file fails, we keep using the old file instead of ending up
-            // with no file at all, which is what used to crash the program.
-            // The earlier version of this code closed the old file first
-            // and only then tried to open the new one. If that open failed,
-            // log was left set to NULL, and later on the cleanup code would
-            // call fclose(NULL), which is undefined behavior and was
-            // actually crashing the daemon during testing. Opening the new
-            // file first avoids that problem completely: if the reopen
-            // fails, we simply keep logging to the file we already have
-            // open.
+            // Open the new file BEFORE closing the old one. The first version
+            // did it the other way round, and when the open failed, log was
+            // left NULL and the cleanup path below called fclose(NULL), which
+            // is undefined behaviour and was crashing the daemon during
+            // testing. Open-first means a failed rotation just keeps logging
+            // to the file already open.
             FILE *nl = open_log(config.log_path);
             if (nl != NULL){
                 fclose(log);
@@ -172,13 +195,17 @@ int main(int argc, char **argv) {
 
         ssize_t n = recvfrom(sfd, buf, sizeof buf - 1, 0, NULL, NULL);
         if (n < 0){
-            if (errno == EINTR) continue;   // A signal interrupted us while we were waiting, so we go back to the top of the loop to check the running and reopen flags.
+            if (errno == EINTR) continue;   // signal while waiting: go back up and re-test running and reopen
+            // Receive timeout expired, nothing arrived. Not an error. Going
+            // back to the top is the whole point: that is where the running
+            // and reopen flags get re-tested.
+            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
             perror("recvfrom");
             break;
         }
-        buf[n] = '\0';                      // A datagram is just raw bytes, not a C string, so we add the null terminator ourselves before treating it as text.
+        buf[n] = '\0';                      // a datagram is raw bytes, not a C string: terminate it before treating it as text
 
-        // Here we build a timestamp in the form "YYYY-MM-DD HH:MM:SS", so every log line shows exactly when it was written.
+        // Timestamp as "YYYY-MM-DD HH:MM:SS", so every line says when it landed.
         time_t now = time(NULL);
         struct tm tm;
         localtime_r(&now, &tm);
@@ -186,16 +213,14 @@ int main(int argc, char **argv) {
         strftime(stamp, sizeof stamp, "%Y-%m-%d %H:%M:%S", &tm);
 
         fprintf(log, "%s %s\n", stamp, buf);
-        fflush(log);                        // We flush right away, so that if the program crashes, we do not lose log lines that were still sitting in a buffer.
+        fflush(log);                        // flush now: a crash must not take buffered lines with it
     }
 
-    // Step 6: clean up before we exit. We close the log file, close the
-    // socket, and then remove the socket file from disk.
-    // We still check that log is not NULL before calling fclose() on it,
-    // even though the open-before-close rotation logic above means log
-    // should never actually be NULL by the time we get here. We keep the
-    // check anyway as a safety net, because cleanup code should never
-    // assume that something earlier could not have gone wrong.
+    // Step 6: clean up. Close the log, close the socket, remove the socket
+    // node from disk.
+    // The NULL check on log stays even though the open-before-close rotation
+    // above means it should never be NULL here. Cleanup code is the wrong
+    // place to assume nothing earlier went wrong.
     if (log) fclose(log);
     close(sfd);
     unlink(config.log_ipc);
