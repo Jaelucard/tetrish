@@ -19,6 +19,7 @@ pid_path       var/run/tetrisd.pid           # configurable PID file path, not h
 bind           127.0.0.1                     # interface to listen on; loopback-only default
 tcp_backlog    128                           # listen() backlog depth
 tcp_keepalive  120                           # SO_KEEPALIVE secs; detects half-dead clients
+ctl_perm       0700                          # octal perms on ctl_path socket, enforced via umask around bind() (parse base 8!)
 
 # Per-IP connection cap, ENFORCED at accept() before the handshake runs. The
 # ordering matters: the handshake costs an RSA signature, so a connect flood
@@ -38,8 +39,7 @@ handshake_budget 32
 
 # ----------PLANNED (post-gate)----------(parsed + stored, NOT yet enforced)
 client_timeout 60                            # close idle client after N secs   [issue #10]
-max_clients    64                            # global cap; per-IP cap above is the enforced one
-ctl_perm       0700                          # octal perms on ctl_path socket   (parse base 8!)
+max_clients    64                            # sizes the fd limit only; per-IP cap above is the enforced admission bound
 
 # --------GAME----------(optional tunables)
 tick_hz              20                       # game ticks/sec
@@ -48,3 +48,11 @@ snapshot_interval    60                       # ticks between SNAPSHOT log recor
 max_rooms            16                       # max concurrent rooms
 max_players_per_room 6                        # cap per room
 garbage_mq           /tetrish-garbage         # POSIX mq name, Battle Royale garbage channel (must start with /)
+
+# ----------DEMO----------(uncomment, or type these at the tetrish prompt)
+# tetrish executes non-directive lines as commands when it sources this file,
+# so uncommenting these brings the whole system up from `./bin/tetrish` alone.
+# (The daemons warn `unknown key 'dspawn'` and ignore the lines - see README
+# known limitation 12.)
+# dspawn bin/tetrislogd .tetrishrc
+# dspawn bin/tetrisd    .tetrishrc
