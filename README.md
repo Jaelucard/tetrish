@@ -53,9 +53,8 @@ macOS and Windows need a container. A `Dockerfile` is included:
 ```sh
 docker build -t tetrish-build .
 docker run -d --name tetrish -v "$PWD":/mnt tetrish-build sleep infinity
-docker exec tetrish sh -c 'cp -r /mnt /work'      # copy INTO the container
-docker exec -it tetrish bash
-cd /work
+docker exec tetrish sh -c 'cp -r /mnt/. /work/project'   # copy the tree INTO the container
+docker exec -it tetrish bash                             # the shell lands in /work/project
 ```
 
 > Copy the tree to a container-local path rather than working in the bind
