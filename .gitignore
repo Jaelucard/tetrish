@@ -32,8 +32,3 @@ build/
 application
 networking
 systems
-# Tooling / harness state
-.omc/
-# Session contract file (workspace-local, not part of the shared repo)
-CLAUDE.md
-.claude/
