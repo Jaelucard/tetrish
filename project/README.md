@@ -71,7 +71,7 @@ a repository is a mistake regardless of the repository) and because
 
 `tetrish` is the entry point. Put the launch commands in your `.tetrishrc` and
 the whole system comes up from one program:
-
++
 ```
 # in .tetrishrc, alongside the configuration directives
 dspawn bin/tetrislogd .tetrishrc

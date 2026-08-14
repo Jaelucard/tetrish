@@ -16,7 +16,7 @@ ctl_path       var/run/tetrisctl.sock        # AF_UNIX STREAM: tetrisctl -> tetr
 # ----------OPERATIONAL----------(optional: parser prefills defaults)
 daemonize      no                            # toggle the double-fork instead of compiling it in
 pid_path       var/run/tetrisd.pid           # configurable PID file path, not hard-coded
-bind           127.0.0.1                     # interface to listen on; loopback-only default
+bind           10.32.60.142                     # interface to listen on; loopback-only default
 tcp_backlog    128                           # listen() backlog depth
 tcp_keepalive  120                           # SO_KEEPALIVE secs; detects half-dead clients
 ctl_perm       0700                          # octal perms on ctl_path socket, enforced via umask around bind() (parse base 8!)

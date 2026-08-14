@@ -912,10 +912,8 @@ static void dispatch_request(client_t *c, const htttp_msg_t *msg){
     // the point is to spend as little of the event loop's time as possible on
     // a client that is flooding it.
     if (rate_limited(c)){
-        slog("warn", "%s: rate limited (over %d requests/second)",
-             c->player_id, CLIENT_MAX_REQ_PER_SEC);
-        send_response(c, HTTTP_429_TOO_MANY_REQUESTS,
-                      "{\"error\": \"too many requests\"}", NULL);
+        slog("warn", "%s: rate limited (over %d requests/second)", c->player_id, CLIENT_MAX_REQ_PER_SEC);
+        send_response(c, HTTTP_429_TOO_MANY_REQUESTS, "{\"error\": \"too many requests\"}", NULL);
         return;
     }
 
@@ -968,6 +966,35 @@ static void dispatch_request(client_t *c, const htttp_msg_t *msg){
         }
         status = do_input(c, rid, pid, msg);
         break;
+    }
+
+    case HTTTP_METHOD_PAUSE: {
+        int auth = check_player_id(c, msg);
+        if (auth != 0){
+            status = send_response(c, (htttp_status_t)auth, "{\"error\": \"auth\"}", NULL);
+            break;
+        }
+        if (pathkind != 1){
+            status = send_response(c, HTTTP_400_BAD_REQUEST, "{\"error\": \"bad path\"}", NULL);
+            break;
+        }
+        status = do_input(c, rid, pid, msg);
+        break;
+    }
+
+    case HTTTP_METHOD_RESUME: {
+        int auth = check_player_id(c, msg);
+        if (auth != 0){
+            status = send_response(c, (htttp_status_t)auth, "{\"error\": \"auth\"}", NULL);
+            break;
+        }
+        if (pathkind != 1){
+            status = send_response(c, HTTTP_400_BAD_REQUEST, "{\"error\": \"bad path\"}", NULL);
+            break;
+        }
+        status = do_input(c, rid, pid, msg);
+        break;
+
     }
 
     default:

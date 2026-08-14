@@ -35,6 +35,8 @@ typedef enum {
                            Last on purpose, so every value above keeps the
                            number it already had and a stale peer that never
                            sends HOLD is unaffected. */
+    HTTTP_METHOD_PAUSE,
+    HTTTP_METHOD_RESUME
 } htttp_method_t;
 
 typedef enum {
