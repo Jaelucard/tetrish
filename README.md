@@ -792,12 +792,7 @@ Things that are true and that we would rather state than have found.
     Dropping is the safer behaviour, but it is not what the handout describes,
     and a `413` for messages that exceed the limit after decryption would be
     the closer reading.
-15. **`401` has no call site.** A request with a missing or wrong `Player-Id` is
-    answered `403`, which is defensible (the server knows who you are from the
-    session, so a mismatched header is a forbidden action rather than a failed
-    authentication) - but the handout lists `401` among the codes that must be
-    reachable, and today it is not.
-16. **`tetrislogd` does not emit a periodic drop summary.** The dropped-record
+15. **`tetrislogd` does not emit a periodic drop summary.** The dropped-record
     count is maintained and readable through `tetrisctl dropped-logs`, but
     nothing prints a recurring `dropped N records in last 30s` line, which is
     what the handout asks for.
