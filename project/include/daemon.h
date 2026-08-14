@@ -2,11 +2,11 @@
 #ifndef DAEMON_H
 #define DAEMON_H
 
-// Double-fork into a background daemon (fork -> setsid -> fork), then redirect
-// stdin/stdout/stderr to /dev/null. Deliberately does NOT chdir("/"), so
+// Double-fork into a background daemon (fork -> setsid -> fork), then point
+// stdin/stdout/stderr at /dev/null. Does NOT chdir("/"), on purpose, so
 // relative config paths keep resolving from the project root.
-// Returns 0 in the surviving daemon process; returns -1 if the first fork fails
-// (the intermediate parents _exit and never return).
+// Returns 0 in the surviving daemon, -1 if the first fork fails. The
+// intermediate parents _exit and never return at all.
 int daemonize(void);
 
 #endif

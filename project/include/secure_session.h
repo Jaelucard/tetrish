@@ -30,20 +30,20 @@ const char *session_strerror(const session_t *s);
 
 #endif
 
-// This header is the one contract used by every corestack consumer:
+// One contract, every corestack consumer:
 // >> 50.005 side : tetrisd (server) and tetrisu (client)
 // >> 50.003 side : mini-gh-tracker (server-only)
 
-// Protocol:
+// Protocol, all seven steps:
 // 1. Client connects, sends a fresh nonce.
 // 2. Server sends its X.509 certificate.
-// 3. Client verifies the certificate against the bundled CA.
+// 3. Client checks that certificate against the bundled CA.
 // 4. Server signs the client nonce with its private key (RSA-PSS).
-// 5. Client verifies the signature using the public key from the cert.
+// 5. Client verifies that signature with the public key from the cert.
 // 6. Client generates a 32-byte AES-256 session key, RSA-OAEP encrypts it with the server's public key, sends it.
-// 7. Every subsequent frame is [4-byte BE length][AES-256-CBC ciphertext], carrying one HTTTP message. Frame size limit: 64 KiB.
+// 7. Every frame after that is [4-byte BE length][AES-256-CBC ciphertext], carrying one HTTTP message. Frames stop at 64 KiB.
 
-// Cryptographic primitives come from common.c only (OpenSSL EVP). 
-// >> Never uses OpenSSL's SSL_* (TLS) API = HTTPS
+// Crypto comes from common.c and nowhere else (OpenSSL EVP).
+// >> Never OpenSSL's SSL_* (TLS) API = HTTPS
 
 // Statically linked into every binary that needs it.

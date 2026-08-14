@@ -83,6 +83,20 @@ for room in repA repB; do
     fi
 done
 
+echo "== a session whose SEED record was dropped still replays =="
+# The SEED record is written once, into the START burst -- the exact moment
+# the log socket is likeliest to drop it. Snapshots re-state the seed, so a
+# log with every SEED line missing must still reconstruct and verify.
+grep -v ' SEED ' var/log/tetrisd.log > var/log/noseed.log
+if ./bin/tetrish-view --verify var/log/noseed.log repA > var/log/replay-noseed.txt 2>&1; then
+    echo "  ok   repA verified with all SEED records stripped"
+    pass=$((pass + 1))
+else
+    sed 's/^/    /' var/log/replay-noseed.txt
+    echo "  FAIL replay should survive a lost SEED record"
+    fail=$((fail + 1))
+fi
+
 echo "== a log with no session is rejected, not silently replayed =="
 : > var/log/empty.log
 if ./bin/tetrish-view --verify var/log/empty.log >/dev/null 2>&1; then

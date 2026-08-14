@@ -1,9 +1,8 @@
-/**
- * Standardised secure-session library shared by tetriSH (tetrisd/tetrisu)
- * and mini-gh-tracker. See include/corestack/secure_session.h for the
- * protocol description.
+/*
+ * The one secure-session implementation, shared by tetriSH (tetrisd/tetrisu)
+ * and mini-gh-tracker. Protocol write-up is in secure_session.h.
  *
- * Crypto (OpenSSL EVP only, no SSL_* / TLS API):
+ * Crypto is EVP only, no SSL_* and no TLS:
  *   - RAND_bytes            : nonce and session key generation
  *   - EVP_DigestSign...      : RSA-PSS signing   (server signs nonce)
  *   - EVP_DigestVerify...    : RSA-PSS verify    (client verifies nonce sig)
@@ -12,10 +11,10 @@
  *   - EVP_Encrypt.. / Decrypt..  : AES-256-CBC   (framed payload encryption)
  *   - X509_verify_cert       : cert chain check   (client validates server cert)
  *
- * Wire format for every message after the handshake:
+ * Every message after the handshake goes out as:
  *   [ 4-byte big-endian length ][ IV (16 bytes) ][ AES-256-CBC ciphertext ]
- * The length field counts only the IV + ciphertext, not itself. Frames
- * larger than SESSION_MAX_FRAME_LEN (64 KiB payload) are rejected.
+ * The length counts the IV and ciphertext, not itself. Anything over
+ * SESSION_MAX_FRAME_LEN (64 KiB of payload) is refused.
  */
 
 #include <stddef.h>
@@ -36,10 +35,10 @@
 #include <openssl/rsa.h>
 #include "secure_session.h"
 
-/* ─────────────────────────── context / session structs ──────────────────── */
+/* context / session structs */
 
 struct session_ctx {
-    int   is_server;         /* 1 = server ctx (cert+key), 0 = client ctx (CA) */
+    int   is_server;         /* 1 = server ctx (cert + key), 0 = client ctx (CA) */
     char  cert_path[512];
     char  key_path[512];
     char  ca_path[512];
@@ -50,19 +49,21 @@ struct session {
     int ready;
     int sockfd;
     char last_error[512];
-    int last_recv_was_oversized;  /* 1 iff the last session_read() failed because the
-                                       * peer's declared frame length exceeded the cap --
-                                       * distinct from a garbled/undecryptable frame, so
-                                       * callers can reply 413 instead of just dropping. */
+    int last_recv_was_oversized;  /* 1 only when the last session_read() failed
+                                       * because the peer's declared frame length
+                                       * blew the cap. Kept separate from a garbled
+                                       * frame so the caller can answer 413 rather
+                                       * than just hang up. */
 
-    /* Stream-read buffer: session_read() decrypts one whole frame at a
-     * time and serves it byte-by-byte to callers, like a real socket. */
+    /* Stream-read buffer. session_read() decrypts a whole frame at a time and
+     * then hands it out in whatever chunks the caller asks for, so it behaves
+     * like a real socket to code above. */
     unsigned char *rbuf;
     size_t rbuf_len;
     size_t rbuf_off;
 };
 
-/* ─────────────────────────── error helpers ───────────────────────────────── */
+/* error helpers */
 
 static void _ssl_err(session_t *sess, const char *context) {
     unsigned long e = ERR_get_error();
@@ -77,7 +78,7 @@ static void _err(session_t *sess, const char *msg) {
     fprintf(stderr, "[secure_session] %s\n", msg);
 }
 
-/* ─────────────────────────── raw socket helpers ──────────────────────────── */
+/* raw socket helpers */
 
 static int send_all(int fd, const void *buf, size_t len) {
     const unsigned char *p = buf;
@@ -93,7 +94,7 @@ static int recv_all(int fd, void *buf, size_t len) {
     unsigned char *p = buf;
     while (len > 0) {
         ssize_t n = recv(fd, p, len, MSG_WAITALL);
-        if (n <= 0) return -1;   /* 0 = peer closed cleanly */
+        if (n <= 0) return -1;   /* 0 means the peer closed on us */
         p += n; len -= (size_t)n;
     }
     return 0;
@@ -131,7 +132,7 @@ static unsigned char *recv_length_prefixed(int fd, size_t *out_len, size_t max_l
     return buf;
 }
 
-/* ─────────────────────────── crypto helpers ──────────────────────────────── */
+/* crypto helpers */
 
 static EVP_PKEY *load_private_key(const char *path) {
     FILE *f = fopen(path, "r");
@@ -342,13 +343,14 @@ fail:
     return -1;
 }
 
-/* ─────────────────────────── context lifecycle ──────────────────────────── */
+/* context lifecycle */
 
 session_ctx_t *session_server_init(const char *cert_path, const char *key_path) {
     if (!cert_path || !key_path) return NULL;
 
-    /* Fail fast if the cert/key don't even load, rather than discovering
-     * this on the first client's handshake. */
+    /* Load both now and throw them away again, just to find out at startup
+     * that they parse. Otherwise the first client to connect is the one who
+     * discovers the cert path is wrong. */
     X509 *c = load_cert_file(cert_path);
     if (!c) {
         fprintf(stderr, "[secure_session] session_server_init: cannot load cert %s\n", cert_path);
@@ -395,7 +397,7 @@ void session_client_ctx_free(session_ctx_t *ctx) {
     free(ctx);
 }
 
-/* ─────────────────────────── handshake — server ──────────────────────────── */
+/* handshake, server side */
 
 session_t *session_accept(session_ctx_t *ctx, int raw_fd) {
     if (!ctx || !ctx->is_server || raw_fd < 0) return NULL;
@@ -482,7 +484,7 @@ fail:
     return NULL;
 }
 
-/* ─────────────────────────── handshake — client ──────────────────────────── */
+/* handshake, client side */
 
 session_t *session_connect(session_ctx_t *ctx, int raw_fd) {
     if (!ctx || ctx->is_server || raw_fd < 0) return NULL;
@@ -573,7 +575,7 @@ fail:
     return NULL;
 }
 
-/* ─────────────────────────── framed I/O (one frame per call) ─────────────── */
+/* framed I/O, one frame per call */
 
 static int session_send_frame(session_t *sess, const unsigned char *plaintext, size_t plain_len) {
     if (plain_len > SESSION_MAX_FRAME_LEN) {
@@ -626,7 +628,7 @@ static ssize_t session_recv_frame(session_t *sess) {
     return (ssize_t)plain_len;
 }
 
-/* ─────────────────────────── public stream I/O ───────────────────────────── */
+/* public stream I/O */
 
 ssize_t session_read(session_t *s, void *buf, size_t len) {
     if (!s || !session_is_ready(s) || !buf || len == 0) {
@@ -637,7 +639,7 @@ ssize_t session_read(session_t *s, void *buf, size_t len) {
     if (s->rbuf_off >= s->rbuf_len) {
         ssize_t rc = session_recv_frame(s);
         if (rc < 0) return -1;
-        if (rc == 0) return 0; /* empty frame: treat like EOF-of-frame, caller retries */
+        if (rc == 0) return 0; /* empty frame, treat as end of frame; caller retries */
     }
 
     size_t avail = s->rbuf_len - s->rbuf_off;
@@ -654,14 +656,14 @@ ssize_t session_write(session_t *s, const void *buf, size_t len) {
     }
     if (len == 0) return 0;
 
-    /* One HTTTP message == one frame, so large messages that exceed the
-     * frame limit must be rejected here (413), same as tetriSH's own
-     * libtetrissh_send/recv split policy. */
+    /* One HTTTP message is one frame. No splitting across frames, so anything
+     * past the limit gets refused right here and the caller answers 413. Same
+     * policy as libtetrissh's own send/recv. */
     if (session_send_frame(s, buf, len) != 0) return -1;
     return (ssize_t)len;
 }
 
-/* ─────────────────────────── teardown / utility ──────────────────────────── */
+/* teardown / utility */
 
 void session_close(session_t *s) {
     if (!s) return;
@@ -670,7 +672,7 @@ void session_close(session_t *s) {
     s->rbuf = NULL;
     s->rbuf_len = s->rbuf_off = 0;
     s->ready = 0;
-    /* Caller owns and closes the underlying fd. */
+    /* fd is not ours; whoever opened it closes it. */
     free(s);
 }
 

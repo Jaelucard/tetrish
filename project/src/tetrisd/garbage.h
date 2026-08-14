@@ -1,9 +1,9 @@
 // The Battle Royale garbage event, carried over the POSIX message queue.
 //
-// This lives in its own header so that test tools can send a well-formed event
-// without duplicating the struct layout. Both ends are the same process on the
-// same machine, so the struct is sent raw with no serialisation. There is no
-// endianness or padding question to answer.
+// It lives in its own header so test tools can send a well-formed event without
+// duplicating the struct layout. Both ends are the same process on the same
+// machine, so the struct goes on the wire raw, with no serialisation: there is
+// no endianness or padding question to answer.
 //
 // Why the payload travels inside the queue rather than the queue being a bare
 // wakeup: a POSIX message queue preserves message boundaries, so one mq_receive
@@ -38,9 +38,9 @@ typedef struct {
 //   2 lines -> 1 row       4 lines -> 4 rows (a "tetris" is rewarded twice over)
 //
 // It lives here, next to the message it fills in, rather than inline in the
-// tick handler, so that it can be unit tested on its own. That matters because
-// the tick handler's copy can only be exercised by a player who actually clears
-// two lines, which no automated client in this repo can currently do.
+// tick handler, so a unit test can reach it. Otherwise the only way to exercise
+// it is a player who actually clears two lines, and no automated client in this
+// repo can do that yet.
 static inline int garbage_rows_for(int lines_cleared){
     if (lines_cleared < 2) return 0;
     return (lines_cleared >= 4) ? 4 : lines_cleared - 1;
